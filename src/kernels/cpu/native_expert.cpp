@@ -192,6 +192,10 @@ bool native_multi_rows_exact(int type) { return exact_rows(type) != nullptr; }
 bool native_rows1_exact(int type) { return exact_rows1(type) != nullptr; }
 
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
+    if ((gu_type == 40) != (d_type == 40)) {
+        err = "native experts: NVFP4 currently requires gate/up and down in NVFP4";
+        return false;
+    }
     if (gu_type < 0 || gu_type >= GGML_TYPE_COUNT || d_type < 0 || d_type >= GGML_TYPE_COUNT) {
         err = "native experts: type " + std::to_string(gu_type) + "/" + std::to_string(d_type) + " is not a ggml type";
         return false;
@@ -220,11 +224,13 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.d_act = (int) td->vec_dot_type;
     f.n_embd = n_embd;
     f.n_ff = n_ff;
+    f.gate_scale = f.up_scale = f.down_scale = 1.f;
     f.gu_row = ggml_row_size((ggml_type) gu_type, n_embd);
     f.d_row = ggml_row_size((ggml_type) d_type, n_ff);
     f.up_off = f.gu_row * (size_t) n_ff;
     f.down_off = 2 * f.up_off;
     f.bytes = f.down_off + f.d_row * (size_t) n_embd;
+    if (f.nvfp4()) f.bytes += 3 * sizeof(float);
     f.act_bytes = ggml_row_size(tg->vec_dot_type, n_embd);
     f.h_bytes = ggml_row_size(td->vec_dot_type, n_ff);
     if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes) {
@@ -251,7 +257,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // both set (and on a CPU without AVX-512, STRATA_NO_IQ512 changes nothing).
     static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
     static const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;   // pre-AVX2: ggml's vec_dot
-    if (nt >= 2 && iq512_supported(f.gu_type)) {   // one token: ggml-cpu is as fast or faster
+    if (nt >= 2 && iq512_supported(f.gu_type) && f.gate_scale == 1.f && f.up_scale == 1.f) {
         if (avx512) {
             iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
             return;
@@ -270,6 +276,8 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             float g = 0.f, u = 0.f;
             dot(n, &g, 0, gr, 0, act[t], 0, 1);
             dot(n, &u, 0, ur, 0, act[t], 0, 1);
+            if (f.gate_scale != 1.f) g *= f.gate_scale;
+            if (f.up_scale != 1.f) u *= f.up_scale;
             ff[t][r] = (g / (1.f + std::exp(-g))) * u;
         }
     }
@@ -299,6 +307,8 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
             for (int t = 0; t < nt; ++t) {
                 for (int r = 0; r < nr; ++r) {
                     float g = go[(size_t) t][r], u = uo[(size_t) t][r];
+                    if (f.gate_scale != 1.f) g *= f.gate_scale;
+                    if (f.up_scale != 1.f) u *= f.up_scale;
                     if (clamp) {
                         g = std::fmin(g, swiglu_limit);
                         u = std::fmin(std::fmax(u, -swiglu_limit), swiglu_limit);
@@ -317,6 +327,8 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
             float g = 0.f, u = 0.f;
             dot(n, &g, 0, gr, 0, act[t], 0, 1);
             dot(n, &u, 0, ur, 0, act[t], 0, 1);
+            if (f.gate_scale != 1.f) g *= f.gate_scale;
+            if (f.up_scale != 1.f) u *= f.up_scale;
             if (clamp) {   // GLM's clamped swiglu (glm_ffn's semantics), matching the device path
                 g = std::fmin(g, swiglu_limit);
                 u = std::fmin(std::fmax(u, -swiglu_limit), swiglu_limit);
@@ -334,6 +346,9 @@ void native_down_rows_split(const NativeFmt& f, const uint8_t* down_base, const 
             o.resize((size_t) nt);
             for (int t = 0; t < nt; ++t) o[(size_t) t] = out[t] + r0;
             fn(f.d_type, down_base + (size_t) r0 * f.d_row, f.d_row, (int) f.n_ff, hq, nt, o.data(), 0, r1 - r0);
+            if (f.down_scale != 1.f)
+                for (int t = 0; t < nt; ++t)
+                    for (int r = r0; r < r1; ++r) out[t][r] *= f.down_scale;
             return;
         }
     }
@@ -344,7 +359,7 @@ void native_down_rows_split(const NativeFmt& f, const uint8_t* down_base, const 
         for (int t = 0; t < nt; ++t) {
             float s = 0.f;
             dot(n, &s, 0, dr, 0, hq[t], 0, 1);
-            out[t][r] = s;
+            out[t][r] = f.down_scale == 1.f ? s : s * f.down_scale;
         }
     }
 }
@@ -358,7 +373,7 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
 #else
     static const bool iq4nl_mt = false;
 #endif
-    if (nt >= 2 && f.d_type == 20 && iq4nl_mt) {
+    if (nt >= 2 && f.d_type == 20 && iq4nl_mt && f.down_scale == 1.f) {
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
@@ -369,7 +384,7 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         for (int t = 0; t < nt; ++t) {
             float s = 0.f;
             dot(n, &s, 0, dr, 0, hq[t], 0, 1);
-            out[t][r] = s;
+            out[t][r] = f.down_scale == 1.f ? s : s * f.down_scale;
         }
     }
 }

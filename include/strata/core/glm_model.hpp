@@ -435,6 +435,7 @@ public:
         strata::kernels::cpu::NativeFmt fmt;
         int gate_shard = 0, up_shard = 0, down_shard = 0;
         uint64_t gate_off = 0, up_off = 0, down_off = 0;   // absolute file offsets of the tensors
+        std::array<std::vector<float>, 3> nvfp4_scales;   // gate/up/down, by expert; appended to cache blobs
         // EXL3 experts (exl3.txt, x_cb >= 0): expert e's part r (gate, up, down) piece j (trellis, suh, svh) lies at
         // x_off[9 e + 3 r + j] of shard x_shard[...]; the blob is [gate | up | down], a part [trellis | suh | svh]
         int x_cb = -1;

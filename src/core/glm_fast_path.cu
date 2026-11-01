@@ -747,7 +747,9 @@ bool Glm5Model::fast_setup(std::string& err) {
         };
         const auto q = [&](const char* n) -> WSlot {
             auto it = ws_map_.find(P + n);
-            if (it == ws_map_.end() || it->second.type == 0 || !gf::mv_supported(it->second.type)) {
+            if (it != ws_map_.end() && it->second.type == 0 && it->second.f32 != nullptr)
+                return WSlot{it->second.f32, gf::kTypeF32, it->second.f32, it->second.n_in, it->second.n_out};
+            if (it == ws_map_.end() || !gf::mv_supported(it->second.type)) {
                 missing += P + n + " (quant) ";
                 return WSlot{};
             }
@@ -849,7 +851,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 Ly.gu_bytes = (size_t) nl.fmt.gu_row * (size_t) g.n_ff_exp;
                 Ly.dn_bytes = (size_t) nl.fmt.d_row * (size_t) g.n_embd;
                 Ly.down_off = 2 * Ly.gu_bytes;
-                Ly.blob = 2 * Ly.gu_bytes + Ly.dn_bytes;
+                Ly.blob = nl.fmt.bytes;
                 if (!gf::moe_supported(Ly.gu_type) || !gf::moe_supported(Ly.d_type) ||
                     gf::row_bytes(Ly.gu_type, g.n_embd) != nl.fmt.gu_row ||
                     gf::row_bytes(Ly.d_type, g.n_ff_exp) != nl.fmt.d_row)
@@ -2562,7 +2564,7 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
         for (int q = (int) ((int64_t) gu_tot * job / T); q < q1;) {
             const int i = q / n_ff, r0 = q % n_ff, r1 = std::min(n_ff, r0 + (q1 - q));
             float* o[1] = {ff + (size_t) i * n_ff};
-            kc::native_gu_rows_split(nf, blob[i], blob[i] + Ly.gu_bytes, a, 1, o, r0, r1, g.swiglu_exp);
+            kc::native_gu_rows_split(nf.scaled(blob[i]), blob[i], blob[i] + Ly.gu_bytes, a, 1, o, r0, r1, g.swiglu_exp);
             q += r1 - r0;
         }
     });
@@ -2575,7 +2577,7 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
             const int i = q / n_embd, r0 = q % n_embd, r1 = std::min(n_embd, r0 + (q1 - q));
             const void* h[1] = {hq + (size_t) i * kc::kNativeHBytes};
             float* o[1] = {dn + (size_t) i * n_embd};
-            kc::native_down_rows_split(nf, blob[i] + Ly.down_off, h, 1, o, r0, r1);
+            kc::native_down_rows_split(nf.scaled(blob[i]), blob[i] + Ly.down_off, h, 1, o, r0, r1);
             q += r1 - r0;
         }
     });
@@ -2732,7 +2734,7 @@ void Glm5Model::win_cpu_merged(int il, int nb, const gf::MoeRequest* const* rq, 
                 a[k] = C.act.data() + (size_t) (u_ent[u][k] / 8) * act_b;
                 o[k] = C.ff.data() + (size_t) u_ent[u][k] * n_ff;
             }
-            kc::native_gu_rows_split(nf, ublob[u], ublob[u] + Ly.gu_bytes, a, u_n[u], o, r0, r1, g.swiglu_exp);
+            kc::native_gu_rows_split(nf.scaled(ublob[u]), ublob[u], ublob[u] + Ly.gu_bytes, a, u_n[u], o, r0, r1, g.swiglu_exp);
         });
         for (int k = 0; k < n; ++k)
             for (int q = 0; q < u_n[hu[k]]; ++q) {
@@ -2746,7 +2748,7 @@ void Glm5Model::win_cpu_merged(int il, int nb, const gf::MoeRequest* const* rq, 
                 hh[k] = C.hq.data() + (size_t) u_ent[u][k] * h_b;
                 o[k] = C.dn.data() + (size_t) u_ent[u][k] * n_embd;
             }
-            kc::native_down_rows_split(nf, ublob[u] + Ly.down_off, hh, u_n[u], o, r0, r1);
+            kc::native_down_rows_split(nf.scaled(ublob[u]), ublob[u] + Ly.down_off, hh, u_n[u], o, r0, r1);
         });
     };
     // EXL3: lane_experts' jobs over a half's distinct experts, each piece's byte-sum products for all the expert's
@@ -2919,21 +2921,22 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
         std::vector<double> hr((size_t) n_ff), ref((size_t) n_embd, 0.0);
         const double lim = g.swiglu_exp;
         for (int i = 0; i < ne; ++i) {
+            const auto sf = nf.scaled(blob[i]);
             for (int r = 0; r < n_ff; ++r) {
                 double gs = 0.0, us = 0.0;
                 tg->to_float(blob[i] + (size_t) r * nf.gu_row, row.data(), n_embd);
                 for (int c = 0; c < n_embd; ++c) gs += (double) row[(size_t) c] * x[c];
                 tg->to_float(blob[i] + Ly.gu_bytes + (size_t) r * nf.gu_row, row.data(), n_embd);
                 for (int c = 0; c < n_embd; ++c) us += (double) row[(size_t) c] * x[c];
-                gs = std::min(gs, lim);
-                us = std::min(std::max(us, -lim), lim);
+                gs = std::min(gs * sf.gate_scale, lim);
+                us = std::min(std::max(us * sf.up_scale, -lim), lim);
                 hr[(size_t) r] = gs / (1.0 + std::exp(-gs)) * us;
             }
             for (int r = 0; r < n_embd; ++r) {
                 double s = 0.0;
                 td->to_float(blob[i] + Ly.down_off + (size_t) r * nf.d_row, row.data(), n_ff);
                 for (int j = 0; j < n_ff; ++j) s += (double) row[(size_t) j] * hr[(size_t) j];
-                ref[(size_t) r] += w[i] * s;
+                ref[(size_t) r] += w[i] * s * sf.down_scale;
             }
         }
         double a = 0, b = 0;
@@ -3549,6 +3552,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         const ggml_type_traits* td = ggml_get_type_traits((ggml_type) Ly.d_type);
         std::vector<float> row((size_t) std::max(E, FFE));
         std::vector<double> hr((size_t) FFE), orf((size_t) E);
+        const auto sf = nf.scaled(cal);
         for (int r = 0; r < FFE; ++r) {
             double gs = 0.0, us = 0.0;
             tg->to_float(cal + (size_t) r * nf.gu_row, row.data(), E);
@@ -3556,15 +3560,15 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             tg->to_float(cal + Ly.gu_bytes + (size_t) r * nf.gu_row, row.data(), E);
             for (int i = 0; i < E; ++i) us += (double) row[(size_t) i] * xc[(size_t) i];
             const double lim = g.swiglu_exp;
-            gs = std::min(gs, lim);
-            us = std::min(std::max(us, -lim), lim);
+            gs = std::min(gs * sf.gate_scale, lim);
+            us = std::min(std::max(us * sf.up_scale, -lim), lim);
             hr[(size_t) r] = gs / (1.0 + std::exp(-gs)) * us;
         }
         for (int r = 0; r < E; ++r) {
             double s = 0.0;
             td->to_float(cal + Ly.down_off + (size_t) r * nf.d_row, row.data(), FFE);
             for (int j = 0; j < FFE; ++j) s += (double) row[(size_t) j] * hr[(size_t) j];
-            orf[(size_t) r] = s;
+            orf[(size_t) r] = s * sf.down_scale;
         }
         double nr = 0, eg = 0, ec = 0, egc = 0;
         for (int r = 0; r < E; ++r) {
@@ -3884,20 +3888,13 @@ bool Glm5Model::fast_warm(std::string& err) {
         F->workers->run(nb * 3, [&](int job) {
             const Job& J = jobs[b + (size_t) (job / 3)];
             const int role = job % 3;
-            const auto& Ly = F->L[(size_t) J.il];
             const auto& nl = pack_layers_[(size_t) J.il];
             if (nl.x_cb >= 0) {   // EXL3: the expert's nine pieces in as few reads as they allow (the first job of 3)
                 if (role == 0) fast_read_expert_x3(J.il, J.e, J.vram ? F->stage[(size_t) (job / 3)] : J.dst);
                 return;
             }
-            const Shard& sh = pack_shards_[(size_t) (role == 0 ? nl.gate_shard : role == 1 ? nl.up_shard : nl.down_shard)];
-            const uint64_t off = role == 0   ? nl.gate_off + (uint64_t) J.e * Ly.gu_bytes
-                                 : role == 1 ? nl.up_off + (uint64_t) J.e * Ly.gu_bytes
-                                             : nl.down_off + (uint64_t) J.e * Ly.dn_bytes;
-            const size_t len = role == 2 ? Ly.dn_bytes : Ly.gu_bytes;
             uint8_t* base = J.vram ? F->stage[(size_t) (job / 3)] : J.dst;
-            uint8_t* d = base + (role == 0 ? 0 : role == 1 ? Ly.gu_bytes : 2 * Ly.gu_bytes);
-            read_slice(sh, off, len, d);
+            fast_read_part(J.il, J.e, role, base, 0, 1);
         });
         for (int k = 0; k < nb; ++k) {
             const Job& J = jobs[b + (size_t) k];
@@ -4885,6 +4882,9 @@ void Glm5Model::fast_read_part(int il, int e, int role, uint8_t* blob, int chunk
     const size_t c0 = std::min(len, (size_t) chunk * piece), c1 = std::min(len, c0 + piece);
     if (c1 > c0)
         read_slice(sh, off + c0, c1 - c0, blob + (role == 0 ? 0 : role == 1 ? Ly.gu_bytes : 2 * Ly.gu_bytes) + c0);
+    if (nl.fmt.nvfp4() && chunk == 0)
+        std::memcpy(blob + Ly.down_off + Ly.dn_bytes + (size_t) role * sizeof(float),
+                    &nl.nvfp4_scales[(size_t) role][(size_t) e], sizeof(float));
 }
 
 // ---- LOOKAHEAD, for the route of layer il (service thread, F->mu held): score the predictions made for this layer

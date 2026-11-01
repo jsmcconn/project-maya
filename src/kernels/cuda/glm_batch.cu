@@ -2675,6 +2675,17 @@ void expert_scatter(const int* ids, const int* rank, const int* base, int n, int
     check("expert_scatter");
 }
 
+__global__ void nvfp4_scale_product_kernel(float* y, int64_t n, int width, const float* scales, bool gate_up) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] *= scales[gate_up ? ((i % width) < width / 2 ? 0 : 1) : 2];
+}
+
+void nvfp4_scale_product(float* y, int64_t n, int width, const float* scales, bool gate_up, cudaStream_t s) {
+    if (n <= 0) return;
+    nvfp4_scale_product_kernel<<<nblk(n), 256, 0, s>>>(y, n, width, scales, gate_up);
+    check("nvfp4_scale_product");
+}
+
 void swiglu_rows(const float* gu, float* h, int rows, int n_ff, float limit, cudaStream_t s, int ld_h) {
     if (rows <= 0) return;
     swiglu_rows_kernel<<<nblk((int64_t) rows * n_ff), 256, 0, s>>>(gu, h, rows, n_ff, ld_h > 0 ? ld_h : n_ff, limit);

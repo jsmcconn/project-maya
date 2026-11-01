@@ -191,6 +191,30 @@ def is_expert(name: str) -> bool:
     return name.startswith("blk.") and name.endswith(("_exps.weight",))
 
 
+def nvfp4_dense_bytes(model: Model, name: str) -> bytes:
+    """Exact decoded NVFP4 weights in F32, including the ModelOpt tensor scale.
+
+    Routed experts retain their original packed bytes. Dense NVFP4 matrices use
+    Maya's F32 projection path; do not round their global scale into block scales.
+    """
+    from _paths import add_gguf_py
+    add_gguf_py()
+    from gguf import quants, GGMLQuantizationType
+    scale_name = name.removesuffix(".weight") + ".scale"
+    scale = np.float32(1)
+    if scale_name in model.where:
+        tensor = model.where[scale_name][1]
+        values = np.frombuffer(model.bytes(scale_name), dtype="<f4")
+        if tensor.type_name != "F32" or values.size != 1 or not np.isfinite(values[0]) or values[0] < 0:
+            raise ValueError("invalid NVFP4 tensor scale: " + scale_name)
+        scale = values[0]
+    elif name.removesuffix(".weight") + ".input_scale" in model.where:
+        raise ValueError("NVFP4 activation scale without weight scale: " + name)
+    values = quants.dequantize(model.bytes(name), GGMLQuantizationType.NVFP4).astype("<f4")
+    values *= scale
+    return values.tobytes()
+
+
 def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: str = "qwen4exp",
                      block_count: int | None = None) -> int:
     """Every non-expert tensor of the model: floats into dense.bin as stored (exact-BF16 F32 routers as BF16),
@@ -227,7 +251,16 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 return 1
             ne0, ne1 = index_shape(t.shape)
             convert = compat_bf16 and needs_bf16(t.name, t.type_name, arch) and t.type_name != "BF16"
-            if t.type_name in FLOAT or convert:
+            if t.type_name == "NVFP4":
+                raw = nvfp4_dense_bytes(model, name)
+                kind = "2"
+                rows.append([name, "0", kind, str(at), str(len(raw)), "0", str(len(raw)), str(ne0), str(ne1),
+                             "0", "0", "1"] + ["0"] * 7)
+                fo.write(raw)
+                pad = (-len(raw)) % ALIGN
+                fo.write(b"\0" * pad)
+                at += len(raw) + pad
+            elif t.type_name in FLOAT or convert:
                 raw = tensor_bytes(mm, g, t).tobytes()
                 if convert:
                     raw = bf16_bytes(np.frombuffer(raw, dtype=np.uint8), t.type_name)
@@ -439,6 +472,12 @@ def main() -> int:
             print("layer %d: gate and up differ in type" % l)
             return 1
         blob = per[0] + per[1] + per[2]
+        if ts[0].type_id == 40 or ts[2].type_id == 40:
+            if ts[0].type_id != 40 or ts[2].type_id != 40:
+                raise ValueError("NVFP4 experts require NVFP4 gate/up/down")
+            if a.experts_bin:
+                raise ValueError("NVFP4 uses GGUF expert slices; --experts-bin is unsupported")
+            blob += 12  # assembled runtime blobs append gate/up/down F32 global scales
         layout.append((l, ts[0].type_id, ts[2].type_id, offset, blob, ts))
         offset += blob * n_expert
     with open(out / "native_experts.txt", "w", encoding="utf-8", newline="\n") as fo:
