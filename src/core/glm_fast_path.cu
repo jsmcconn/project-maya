@@ -1795,6 +1795,14 @@ bool Glm5Model::fast_setup(std::string& err) {
             cls_cap[c] = std::max<int64_t>(1, (int64_t) (cls_weight[c] / (double) cls_stride[c])) + 16;
             cls_n[c] = std::min<int64_t>(n, cls_cap[c]);
         }
+        // Resident mode below requires every class's full cap. Proportional
+        // allocation can clip a small class (e.g. one BF16 MTP layer beside
+        // NVFP4 trunk layers) while another class leaves budget unused.
+        if (F->ram_resident && !staging_only && !balanced_ram &&
+            !glmfast::ram_class_plan((uint64_t) std::max<int64_t>(0, budget), cls_stride, cls_cap, cls_cap, cls_n)) {
+            err = "glm fast: resident RAM class capacities exceed the available pinned budget";
+            return false;
+        }
         if (balanced_ram) {
             // Preserve the existing 512 MiB upload guard and leave room for the
             // update tables, disk staging, and a small allocation overhead. DXGI

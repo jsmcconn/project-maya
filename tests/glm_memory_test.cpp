@@ -66,6 +66,11 @@ static void check_ram_plan() {
     assert(ram_class_plan(std::numeric_limits<uint64_t>::max(), {1}, {0}, {1}, slots));
     assert(slots[0] == 1);
     assert(ram_class_plan(0, {}, {}, {}, slots) && slots.empty());
+    // Full resident caps for differently sized trunk/draft experts: assigning
+    // each class a proportional share must not strand room in the other class.
+    assert(ram_class_plan(1024, {4, 12}, {100, 52}, {100, 52}, slots));
+    assert((slots == std::vector<int64_t>{100, 52}));
+    assert(!ram_class_plan(1023, {4, 12}, {100, 52}, {100, 52}, slots));
     assert(ram_class_plan(0, {4}, {0}, {0}, slots) && slots[0] == 0);
 
     // Exhaust small integer budgets, including rounding residue and zero slots.
