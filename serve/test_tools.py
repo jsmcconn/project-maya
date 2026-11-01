@@ -311,6 +311,10 @@ class JsonMode(unittest.TestCase):
             body = {"messages": self.MESSAGES, **({"response_format": rf} if rf else {})}
             prompt, _, _ = self.prompt_for(body)
             self.assertNotIn("Return only", prompt)
+    def test_python_code_is_not_replaced_by_an_empty_json_fragment(self):
+        from serve.server import json_from_text
+        source = "```python\ndef admit(times):\n    decisions = []\n    counts = {}\n    return decisions\n```"
+        self.assertEqual(json_from_text(source), source)
 
 
 class ConditionalThinkingTools(unittest.TestCase):
