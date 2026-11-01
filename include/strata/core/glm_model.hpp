@@ -737,12 +737,12 @@ public:
     bool hop_to_next(Glm5Model* B, int64_t p, std::string& err);
     bool spec_head(int64_t p, int32_t token, std::string& err);
     bool spec_tail(Glm5Model* head, int64_t p, std::string& err);
-    /// The one-GPU MTP decode (src/core/glm_mtp.cu): each round the NextN block drafts up to n tokens in a chain (its
+    /// The block MTP decode (src/core/glm_mtp.cu): each round the last part's NextN block drafts up to n tokens (its
     /// own hidden state feeding the next step), one verify window (window()) checks [last token, drafts...], the
     /// target's samples accept the drafts while they match (window_commit keeps them), and the NextN block's cache takes
     /// the kept rows with the trunk's hidden states.  The same tokens the token-at-a-time loop gives for the same
     /// samples.  On by default on the Strix / Gorgon Halo APUs (gfx115x, mtp_decode_default); STRATA_GLM_MTP_DECODE=1
-    /// elsewhere, =0 off.  mtp_ready(): this model was set up for it.
+    /// elsewhere (one or two GPUs), =0 off. mtp_ready(): this model was set up for it.
     static bool mtp_decode_wanted(int dev, int n_parts);
     bool mtp_ready() const;
     bool decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
@@ -751,7 +751,7 @@ public:
     uint64_t mtp_round_n_[9] = {};                         // ... by the draft length the round used
     bool mtp_fill_prev(int32_t token, int64_t p, std::string& err);   // the token path: entry p - 1 from head_x and token
 private:
-    bool mtp_dec_ = false;                                 // the one-GPU MTP decode is set up on this part
+    bool mtp_dec_ = false;                                 // the block MTP drafter is set up on this part
     int64_t mtp_hx_pos_ = -1;                              // the position whose trunk hidden state head_x holds
     // the adaptive draft length: per length n, the rounds' wall time (EMA, ms) and how many; per draft position, how
     // often it was reached (its earlier drafts all accepted) and accepted - decayed counts, the recent text's
