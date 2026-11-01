@@ -7275,8 +7275,15 @@ __global__ void __launch_bounds__(GU_WARPS * 32) moe_win_gu_kernel(const STRATA_
         if (lane == 0) {
 #pragma unroll
             for (int j = 0; j < RPW; ++j) {
-                sg[warp * RPW + j] = s[j];
-                su[warp * RPW + j] = s[RPW + j];
+                float gate = s[j], up = s[RPW + j];
+                if constexpr (TG == 40) {
+                    const float* scales = (const float*) (blob + w.down_off +
+                        (size_t) w.n_embd * rbytes<40>(w.n_ff));
+                    gate *= scales[0];
+                    up *= scales[1];
+                }
+                sg[warp * RPW + j] = gate;
+                su[warp * RPW + j] = up;
             }
         }
         __syncthreads();
@@ -7310,6 +7317,11 @@ __global__ void __launch_bounds__(256) moe_win_down_kernel(const STRATA_GRID_CON
         const int e = w.grp_ent[m];
         float s[NR];
         rows_dot<TD, NR>(rows, (const block_q8_1*) w.hq + (size_t) e * (w.n_ff / 32), w.n_ff, lane, s_tab, s);
+        if constexpr (TD == 40) {
+            const float scale = *(const float*) (blob + w.down_off + (size_t) w.n_embd * drb + 2 * sizeof(float));
+#pragma unroll
+            for (int j = 0; j < NR; ++j) s[j] *= scale;
+        }
         if (lane == 0)
 #pragma unroll
             for (int j = 0; j < NR; ++j) w.part[(size_t) e * w.n_embd + r0 + j] = s[j];
@@ -7335,6 +7347,7 @@ __global__ void moe_win_combine_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
 }  // namespace
 
 bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s, bool par_group) {
+    if ((gu_type == 40) != (d_type == 40)) return false;
     if (w.T < 1 || w.T > kMaxWinTokens || w.k > 8 || w.n_ff % GU_ROWS != 0 || w.n_embd % DOWN_ROWS != 0) return false;
     if (par_group) moe_win_group_par_kernel<<<1, kWinEnt, 0, s>>>(w);
     else moe_win_group_kernel<<<1, 32, 0, s>>>(w);
@@ -7343,14 +7356,14 @@ bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s, b
     switch (gu_type) {
 #define GLMF_WGU(T)         case T: moe_win_gu_kernel<T><<<ggu, GU_WARPS * 32, 0, s>>>(w); break;
         GLMF_WGU(16) GLMF_WGU(18) GLMF_WGU(19) GLMF_WGU(23) GLMF_WGU(10) GLMF_WGU(11) GLMF_WGU(17) GLMF_WGU(22)
-        GLMF_WGU(21) GLMF_WGU(29) GLMF_WGU(12) GLMF_WGU(13) GLMF_WGU(14) GLMF_WGU(8)
+        GLMF_WGU(21) GLMF_WGU(29) GLMF_WGU(12) GLMF_WGU(13) GLMF_WGU(14) GLMF_WGU(8) GLMF_WGU(40)
 #undef GLMF_WGU
         default: return false;
     }
     switch (d_type) {
 #define GLMF_WDN(T)         case T: moe_win_down_kernel<T><<<gdn, 256, 0, s>>>(w); break;
         GLMF_WDN(16) GLMF_WDN(18) GLMF_WDN(19) GLMF_WDN(23) GLMF_WDN(10) GLMF_WDN(11) GLMF_WDN(17) GLMF_WDN(22)
-        GLMF_WDN(21) GLMF_WDN(29) GLMF_WDN(12) GLMF_WDN(13) GLMF_WDN(14) GLMF_WDN(8)
+        GLMF_WDN(21) GLMF_WDN(29) GLMF_WDN(12) GLMF_WDN(13) GLMF_WDN(14) GLMF_WDN(8) GLMF_WDN(40)
 #undef GLMF_WDN
         default: return false;
     }

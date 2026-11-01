@@ -120,4 +120,25 @@ static void bf16_expert(int gpu) {
     for(void* p:{(void*)db,(void*)dx,(void*)dq,(void*)m.plan_ptr,(void*)m.plan_w,(void*)m.cpu_flag,(void*)hq,(void*)out,(void*)d16})ck(cudaFree(p));
     ck(cudaDeviceSynchronize());req(gf::launch_errors()==0,"BF16 MTP launches");std::printf("GPU %d BF16 MTP expert PASS\n",gpu);
 }
-int main(){ int n=0; ck(cudaGetDeviceCount(&n));req(n>0,"GPU required");for(int i=0;i<n;++i){run(i);bf16_expert(i);} }
+
+static void window_case(int gpu) {
+    ck(cudaSetDevice(gpu));constexpr int E=256,F=128;kc::NativeFmt nf;std::string err;req(kc::native_fmt(40,40,E,F,nf,err),err.c_str());
+    std::vector<uint8_t> b(nf.bytes);uint32_t seed=29;uint8_t* experts[2];
+    for(int e=0;e<2;++e) {
+        for(size_t i=0;i<nf.bytes-12;i+=36) { for(int j=0;j<4;++j)b[i+j]=24+(i/36+j)%8;for(int j=4;j<36;++j){seed=1664525*seed+1013904223;b[i+j]=seed>>24;} }
+        float scales[3]={.25f*(e+1),.75f*(e+1),.0625f*(e+1)};std::memcpy(b.data()+nf.bytes-12,scales,12);experts[e]=dev(b.data(),b.size());
+    }
+    for(int T:{2,5,16}) {
+        std::vector<float> x(T*E),weights(T*8),shared(T*E);std::vector<unsigned long long> pointers(T*8);std::vector<int> flags(T,0);
+        for(int t=0;t<T;++t) { for(int i=0;i<E;++i){x[t*E+i]=std::sin(t*.37f+i*.21f)*.8f;shared[t*E+i]=std::cos(t*.31f+i*.19f)*.001f;}pointers[t*8]=(unsigned long long)experts[t%2];pointers[t*8+1]=t%3==2?0:(unsigned long long)experts[1-t%2];weights[t*8]=.65f;weights[t*8+1]=.35f; }
+        auto dx=dev(x.data(),x.size());auto xq=dev<uint8_t>(nullptr,T*E/32*36);for(int t=0;t<T;++t)gf::quantize_q8_1(dx+t*E,xq+t*E/32*36,E,nullptr);
+        auto pp=dev(pointers.data(),pointers.size());auto pw=dev(weights.data(),weights.size());auto cf=dev(flags.data(),flags.size());auto sh=dev(shared.data(),shared.size());auto hq=dev<uint8_t>(nullptr,T*8*F/32*36);auto ref=dev<float>(nullptr,T*E);auto out=dev<float>(nullptr,T*E);
+        for(int t=0;t<T;++t) {gf::MoeDev md;md.plan_ptr=pp+t*8;md.plan_w=pw+t*8;md.cpu_flag=cf+t;gf::moe_gate_up(40,md,2,E,F,.7f,xq+t*E/32*36,hq+t*8*F/32*36,nullptr,0,nullptr,0,nullptr,nullptr);gf::moe_down(40,md,2,E,F,nf.down_off,hq+t*8*F/32*36,sh+t*E,ref+t*E,nullptr);}
+        const auto reference=read(ref,T*E);
+        gf::MoeWin mw;mw.plan_ptr=pp;mw.plan_w=pw;mw.cpu_flag=cf;mw.xq=xq;mw.xq_stride=E/32*36;mw.hq=hq;mw.part=dev<float>(nullptr,T*8*E);mw.sh_out=sh;mw.out=out;mw.out_stride=E;mw.grp_ptr=dev<unsigned long long>(nullptr,T*8);mw.grp_start=dev<int>(nullptr,T*8+1);mw.grp_ent=dev<int>(nullptr,T*8);mw.n_groups=dev<int>(nullptr,1);mw.T=T;mw.k=2;mw.n_embd=E;mw.n_ff=F;mw.limit=.7f;mw.down_off=nf.down_off;
+        for(bool par:{false,true}) { req(gf::moe_win_experts(40,40,mw,nullptr,par),"NVFP4 batched expert dispatch");const auto actual=read(out,T*E);req(std::memcmp(actual.data(),reference.data(),actual.size()*4)==0,"NVFP4 grouped experts must match token kernels bit for bit"); }
+        for(void* p:{(void*)dx,(void*)xq,(void*)pp,(void*)pw,(void*)cf,(void*)sh,(void*)hq,(void*)ref,(void*)out,(void*)mw.part,(void*)mw.grp_ptr,(void*)mw.grp_start,(void*)mw.grp_ent,(void*)mw.n_groups})ck(cudaFree(p));
+    }
+    for(auto p:experts)ck(cudaFree(p));ck(cudaDeviceSynchronize());req(gf::launch_errors()==0,"window launch errors");std::printf("GPU %d NVFP4 grouped window bit-exact PASS\n",gpu);
+}
+int main(){ int n=0; ck(cudaGetDeviceCount(&n));req(n>0,"GPU required");for(int i=0;i<n;++i){run(i);bf16_expert(i);window_case(i);} }
