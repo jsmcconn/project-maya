@@ -99,12 +99,22 @@ GLM5NEXT_NATIVE_OK = (
 )
 ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next")   # unsloth spells it without the hyphen
 
+# The fast GLM reader consumes these as BF16; its remaining small parameters
+# have F32 readers. Preserve original F32 parameters (notably A_log-derived
+# ssm_a, dt_bias and mHC bases/scales) rather than rounding them in compat mode.
+GLM5NEXT_BF16_ONLY = (
+    "hc_attn_fn.weight", "hc_ffn_fn.weight", "ffn_gate_inp.weight",
+    "indexer.attn_q_b.weight", "indexer.attn_k.weight", "indexer_compressor_gate.weight", "indexer.proj.weight",
+    "ssm_beta.weight", "ssm_f_a.weight", "ssm_f_b.weight", "ssm_g_a.weight", "ssm_g_b.weight",
+    "attn_k_b.weight", "attn_v_b.weight",
+)
+
 
 def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
     if arch in ("glm5-next", "glm5next"):
         # glm5-next has no PLE and no output_hc; its F32 router stays F32 (the runner reads it
         # as F32 by config), so ONLY the listed projections take the BF16 path.
-        return name.startswith("blk.") and name.endswith(GLM5NEXT_BF16)
+        return name.startswith("blk.") and name.endswith(GLM5NEXT_BF16_ONLY if type_name == "F32" else GLM5NEXT_BF16)
     if name in BF16_OUTPUT:
         return True
     if not name.startswith("blk."):
