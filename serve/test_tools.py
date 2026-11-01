@@ -267,6 +267,11 @@ class JsonMode(unittest.TestCase):
             "model": "m", "response_format": {"type": "json_object"}, "messages": [{"role": "user", "content": "json"}]})
         self.assertEqual(json.loads(b["choices"][0]["message"]["content"]), {"city": "Paris"})
 
+    def test_python_code_is_not_replaced_by_an_empty_json_fragment(self):
+        from serve.server import json_from_text
+        source = "```python\ndef admit(times):\n    decisions = []\n    counts = {}\n    return decisions\n```"
+        self.assertEqual(json_from_text(source), source)
+
 
 class ConditionalThinkingTools(unittest.TestCase):
     """A RED-SNOW-style template must open the block the server's parser expects by default."""
