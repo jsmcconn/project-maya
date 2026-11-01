@@ -645,6 +645,20 @@ __device__ __forceinline__ float dot_nvfp4(const void* w, const block_q8_1* x, i
 
 // qk = values per block, ipb = dot calls per block, step = iqs stride, bytes = block bytes
 template<int T> struct F;
+// BF16 routed experts (the original Swift MTP block): preserve weights and
+// consume the decoder's existing Q8_1 activation, eight elements per lane.
+template<> struct F<30> {
+    static constexpr int qk = 32, ipb = 4, step = 8, bytes = 64;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) {
+        const uint16_t* w = (const uint16_t*) v + kbx * 32 + iqs;
+        float sum = 0.f;
+        const float d = __low2float(y->ds);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i)
+            sum += __uint_as_float((unsigned) w[i] << 16) * (d * (float) y->qs[iqs + i]);
+        return sum;
+    }
+};
 template<> struct F<40> { static constexpr int qk = 64, ipb = 2, step = 4, bytes = sizeof(block_nvfp4);
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return dot_nvfp4(v, y, kbx, iqs); } };
 template<> struct F<12> { static constexpr int qk = 256, ipb = 16, step = 2, bytes = sizeof(block_q4_K);
@@ -1360,7 +1374,7 @@ __device__ __forceinline__ void rows_dot(const uint8_t* const* rows, const block
 #pragma unroll
             for (int r = 0; r < NR; ++r) acc[r] += dwk<T>(rows[r], kbx, iqs, xk);
         }
-    } else if constexpr (T == 8 || T == 12 || T == 13 || T == 14 || T == 40) {
+    } else if constexpr (T == 8 || T == 12 || T == 13 || T == 14 || T == 30 || T == 40) {
         // Q4_K / Q5_K / Q6_K experts (K-quant GGUFs other than Maya's): no shared-activation form yet - each row
         // takes the dense GEMV's dot (row_dot), the activation re-read per row
         for (int k = lane; k < nb * Fm::ipb; k += 32) {
@@ -5474,7 +5488,7 @@ bool mv_supported(int type) { return mv_type_ok(type) != 0; }
 
 bool moe_supported(int type) {   // moe_gate_up's and moe_down's instantiations
     return type == 8 || type == 10 || type == 11 || type == 12 || type == 13 || type == 14 || type == 16 || type == 17 ||
-           type == 18 || type == 19 || type == 21 || type == 22 || type == 23 || type == 29 || type == 40;
+           type == 18 || type == 19 || type == 21 || type == 22 || type == 23 || type == 29 || type == 30 || type == 40;
 }
 
 int launch_errors() { return g_launch_errors.load(std::memory_order_relaxed) + exl3::launch_errors(); }
@@ -6963,7 +6977,7 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
         case T: moe_gate_up_kernel<T><<<grid, GU_WARPS * 32, gx, s>>>(d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, \
                                                                       n_ff_sh, sh_out); break;
         GLMF_GU(16) GLMF_GU(18) GLMF_GU(19) GLMF_GU(23) GLMF_GU(10) GLMF_GU(11) GLMF_GU(17) GLMF_GU(22) GLMF_GU(21) GLMF_GU(29)
-        GLMF_GU(12) GLMF_GU(13) GLMF_GU(14) GLMF_GU(8) GLMF_GU(40)
+        GLMF_GU(12) GLMF_GU(13) GLMF_GU(14) GLMF_GU(8) GLMF_GU(30) GLMF_GU(40)
 #undef GLMF_GU
         default: std::fprintf(stderr, "glm_fast moe_gate_up: type %d unsupported\n", gu_type); return;
     }
@@ -7069,7 +7083,7 @@ void moe_down(int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, size_
 #define GLMF_DN(T) \
         case T: moe_down_kernel<T><<<blocks, 256, 0, s>>>(d, k, n_embd, n_ff, down_off, H, sh_out, out); break;
         GLMF_DN(16) GLMF_DN(18) GLMF_DN(19) GLMF_DN(23) GLMF_DN(10) GLMF_DN(11) GLMF_DN(17) GLMF_DN(22) GLMF_DN(21) GLMF_DN(29)
-        GLMF_DN(12) GLMF_DN(13) GLMF_DN(14) GLMF_DN(8) GLMF_DN(40)
+        GLMF_DN(12) GLMF_DN(13) GLMF_DN(14) GLMF_DN(8) GLMF_DN(30) GLMF_DN(40)
 #undef GLMF_DN
         default: std::fprintf(stderr, "glm_fast moe_down: type %d unsupported\n", d_type); return;
     }

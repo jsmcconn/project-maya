@@ -95,4 +95,29 @@ static void run(int gpu) {
     }
     ck(cudaFree(dx));ck(cudaFree(xq)); ck(cudaDeviceSynchronize()); req(gf::launch_errors()==0,"launch errors"); std::printf("GPU %d NVFP4 PASS\n",gpu);
 }
-int main(){ int n=0; ck(cudaGetDeviceCount(&n));req(n>0,"GPU required");for(int i=0;i<n;++i)run(i); }
+
+static void bf16_expert(int gpu) {
+    ck(cudaSetDevice(gpu)); constexpr int E=256,F=128; kc::NativeFmt nf; std::string err;
+    req(kc::native_fmt(30,30,E,F,nf,err),err.c_str());
+    std::vector<uint16_t> bits(3*F*E);std::vector<float> w(bits.size());
+    for(size_t i=0;i<w.size();++i) { bits[i]=ggml_fp32_to_bf16(std::cos(i*.17f)*.05f).bits; uint32_t b=(uint32_t)bits[i]<<16;std::memcpy(&w[i],&b,4); }
+    auto db=dev(bits.data(),bits.size());std::vector<float>x(E);for(int i=0;i<E;++i)x[i]=std::sin(i*.21f)*.6f;
+    auto dx=dev(x.data(),x.size());auto dq=dev<uint8_t>(nullptr,E/32*36);gf::quantize_q8_1(dx,dq,E,nullptr);auto xd=q8read(dq,E);
+    unsigned long long pointers[8]={(unsigned long long)db};float weights[8]={.75f};int zero=0;
+    gf::MoeDev m;m.plan_ptr=dev(pointers,8);m.plan_w=dev(weights,8);m.cpu_flag=dev(&zero,1);
+    auto hq=dev<uint8_t>(nullptr,F/32*36*8);auto out=dev<float>(nullptr,E);
+    gf::moe_gate_up(30,m,1,E,F,.7f,dq,hq,nullptr,0,nullptr,0,nullptr,nullptr);auto h=q8read(hq,F);
+    auto g=product(w.data(),xd.data(),F,E,1),u=product(w.data()+F*E,xd.data(),F,E,1);std::vector<float> ref(F);
+    for(int i=0;i<F;++i)ref[i]=silu(g[i],u[i]);near(h,ref,.008f,"BF16 MTP GPU GU Q8 rounding");
+    gf::moe_down(30,m,1,E,F,nf.down_off,hq,nullptr,out,nullptr);near(read(out,E),product(w.data()+2*F*E,h.data(),E,F,.75f),2e-5f,"BF16 MTP GPU down");
+    std::vector<uint8_t> aq(nf.act_bytes),cq(nf.h_bytes);std::vector<float> xc(E),hc(F),yc(E),hd(F);
+    kc::native_quant_act(nf,x.data(),aq.data());ggml_get_type_traits((ggml_type)nf.gu_act)->to_float(aq.data(),xc.data(),E);
+    const void* ap=aq.data();float* hp=hc.data();auto blob=(const uint8_t*)bits.data();kc::native_gu_rows_split(nf,blob,blob+nf.up_off,&ap,1,&hp,0,F,.7f);
+    g=product(w.data(),xc.data(),F,E,1);u=product(w.data()+F*E,xc.data(),F,E,1);for(int i=0;i<F;++i)ref[i]=silu(g[i],u[i]);near(hc,ref,2e-5f,"BF16 MTP CPU GU");
+    kc::native_quant_h(nf,hc.data(),cq.data());ggml_get_type_traits((ggml_type)nf.d_act)->to_float(cq.data(),hd.data(),F);
+    const void* cp=cq.data();float* yp=yc.data();kc::native_down_rows_split(nf,blob+nf.down_off,&cp,1,&yp,0,E);near(yc,product(w.data()+2*F*E,hd.data(),E,F,1),2e-5f,"BF16 MTP CPU down");
+    req(mq::to_f16_supported(30),"BF16 MTP prefill converter");auto d16=dev<uint16_t>(nullptr,bits.size());mq::to_f16(30,db,d16,bits.size(),nullptr);auto actual=read(d16,bits.size());for(size_t i=0;i<actual.size();++i)req(actual[i]==ggml_fp32_to_fp16(w[i]),"BF16 MTP prefill exact conversion");
+    for(void* p:{(void*)db,(void*)dx,(void*)dq,(void*)m.plan_ptr,(void*)m.plan_w,(void*)m.cpu_flag,(void*)hq,(void*)out,(void*)d16})ck(cudaFree(p));
+    ck(cudaDeviceSynchronize());req(gf::launch_errors()==0,"BF16 MTP launches");std::printf("GPU %d BF16 MTP expert PASS\n",gpu);
+}
+int main(){ int n=0; ck(cudaGetDeviceCount(&n));req(n>0,"GPU required");for(int i=0;i<n;++i){run(i);bf16_expert(i);} }
