@@ -617,8 +617,36 @@ __device__ __forceinline__ float dot_iq4_xs(const void* vbq, const block_q8_1* b
     return d * sumi;
 }
 
+// GGUF NVFP4: four E4M3 scales and 32 packed E2M1 bytes per 64 values.
+// kvalues_mxfp4 doubles E2M1, hence the half-scale here (ggml's UE4M3 convention).
+__device__ __forceinline__ float nvfp4_scale(uint8_t x) {
+    if (x == 0 || x == 127) return 0.f;
+    const int e = x >> 3, m = x & 7;
+    return e == 0 ? (float) m * (1.f / 1024.f) : ldexpf(1.f + (float) m / 8.f, e - 8);
+}
+__device__ __forceinline__ float dot_nvfp4(const void* w, const block_q8_1* x, int kbx, int iqs) {
+    const block_nvfp4* b = (const block_nvfp4*) w + kbx;
+    float sum = 0.f;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int q0 = iqs + 2 * i, sub = q0 / 2;
+        const int2 v0 = get_int_from_table_16(get_int_b4(b->qs, q0), kvalues_mxfp4);
+        const int2 v1 = get_int_from_table_16(get_int_b4(b->qs, q0 + 1), kvalues_mxfp4);
+        const block_q8_1* a = x + sub / 2;
+        const int j = (sub & 1) * 4;
+        int dot = __dp4a(v0.x, get_int_b4(a->qs, j), 0);
+        dot = __dp4a(v0.y, get_int_b4(a->qs, j + 2), dot);
+        dot = __dp4a(v1.x, get_int_b4(a->qs, j + 1), dot);
+        dot = __dp4a(v1.y, get_int_b4(a->qs, j + 3), dot);
+        sum += nvfp4_scale(b->d[sub]) * __low2float(a->ds) * (float) dot;
+    }
+    return sum;
+}
+
 // qk = values per block, ipb = dot calls per block, step = iqs stride, bytes = block bytes
 template<int T> struct F;
+template<> struct F<40> { static constexpr int qk = 64, ipb = 2, step = 4, bytes = sizeof(block_nvfp4);
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return dot_nvfp4(v, y, kbx, iqs); } };
 template<> struct F<12> { static constexpr int qk = 256, ipb = 16, step = 2, bytes = sizeof(block_q4_K);
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return dot_q4_K(v, y, kbx, iqs); } };
 template<> struct F<13> { static constexpr int qk = 256, ipb = 16, step = 2, bytes = sizeof(block_q5_K);
@@ -1332,7 +1360,7 @@ __device__ __forceinline__ void rows_dot(const uint8_t* const* rows, const block
 #pragma unroll
             for (int r = 0; r < NR; ++r) acc[r] += dwk<T>(rows[r], kbx, iqs, xk);
         }
-    } else if constexpr (T == 8 || T == 12 || T == 13 || T == 14) {
+    } else if constexpr (T == 8 || T == 12 || T == 13 || T == 14 || T == 40) {
         // Q4_K / Q5_K / Q6_K experts (K-quant GGUFs other than Maya's): no shared-activation form yet - each row
         // takes the dense GEMV's dot (row_dot), the activation re-read per row
         for (int k = lane; k < nb * Fm::ipb; k += 32) {
@@ -1376,6 +1404,18 @@ __device__ __forceinline__ float row_dot_t(const uint8_t* row, const block_q8_1*
 
 __device__ __forceinline__ float any_row_dot(int type, const void* w, int row, const void* xq, const float* xf,
                                              int n_in, int lane) {
+    // Some mixer/shared-FFN stages retain only their q8_1 activation. Keep BF16/F32
+    // weights at their original precision and consume that existing activation.
+    if ((type == kTypeF32 || type == kTypeBF16) && xf == nullptr && xq != nullptr) {
+        const block_q8_1* a = (const block_q8_1*) xq;
+        float s = 0.f;
+        for (int i = lane; i < n_in; i += 32) {
+            const float v = type == kTypeF32 ? ((const float*) w)[(size_t) row * n_in + i]
+                : __uint_as_float((unsigned) ((const uint16_t*) w)[(size_t) row * n_in + i] << 16);
+            s += v * (__low2float(a[i / 32].ds) * (float) a[i / 32].qs[i % 32]);
+        }
+        return warp_sum(s);
+    }
     switch (type) {
         case kTypeF32: return row_dot_f32((const float*) w + (size_t) row * n_in, xf, n_in, lane);
         case kTypeBF16: return row_dot_bf16((const uint16_t*) w + (size_t) row * n_in, xf, n_in, lane);
@@ -1488,7 +1528,7 @@ __global__ void __launch_bounds__(256) mv_kernel_cols(const STRATA_GRID_CONSTANT
     const int row = (bid - blk0) * MV_ROWS + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
     if (row >= J.n_out) return;
-    if (J.type == kTypeBF16) {
+    if (J.type == kTypeBF16 && J.xf != nullptr) {
         float s[kMaxMvCols];
         row_dot_bf16_cols((const uint16_t*) J.w + (size_t) row * J.n_in, J.xf, J.xf_cstride, J.ncol, J.n_in, lane, s);
         if (lane == 0)
@@ -1499,7 +1539,7 @@ __global__ void __launch_bounds__(256) mv_kernel_cols(const STRATA_GRID_CONSTANT
     }
     for (int c = 0; c < J.ncol; ++c) {   // (the other types: the row's later columns read its weights from cache)
         const float s = any_row_dot(J.type, J.w, row, (const uint8_t*) J.xq + c * J.xq_cstride,
-                                    J.xf + c * J.xf_cstride, J.n_in, lane);
+                                    J.xf ? J.xf + c * J.xf_cstride : nullptr, J.n_in, lane);
         if (lane == 0) J.y[c * J.y_cstride + row] = mv_out(J.alpha, s, J.bias ? J.bias[row] : 0.0f);
     }
 }
@@ -4844,8 +4884,13 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     }
     __syncthreads();
     if (warp == 0) {
-        const float g = fminf(sg[lane], limit);
-        const float u = fminf(fmaxf(su[lane], -limit), limit);
+        float gs = 1.f, us = 1.f;
+        if constexpr (TG == 40) {
+            const float* scales = (const float*) (blob + 3 * (size_t) n_ff * rb);
+            gs = scales[0]; us = scales[1];
+        }
+        const float g = fminf(sg[lane] * gs, limit);
+        const float u = fminf(fmaxf(su[lane] * us, -limit), limit);
         q8_1_store_warp((g / (1.0f + expf(-g))) * u, hq + (size_t) ei * (n_ff / 32) + chunk, lane);
     }
 }
@@ -4923,6 +4968,11 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
             if constexpr (sm60_sign_on<TD>) rows_dot<TD, NR, true>(rows, hq + (size_t) warp * (n_ff / 32), n_ff, lane, tab, s, s_sg); else
 #endif
             rows_dot<TD, NR>(rows, hq + (size_t) warp * (n_ff / 32), n_ff, lane, tab, s);
+            if constexpr (TD == 40) {
+                const float scale = *(const float*) ((const uint8_t*) s_ptr[warp] + down_off + (size_t) n_embd * drb + 2 * sizeof(float));
+#pragma unroll
+                for (int j = 0; j < NR; ++j) s[j] *= scale;
+            }
         } else {
 #pragma unroll
             for (int j = 0; j < NR; ++j) s[j] = 0.0f;
@@ -5424,7 +5474,7 @@ bool mv_supported(int type) { return mv_type_ok(type) != 0; }
 
 bool moe_supported(int type) {   // moe_gate_up's and moe_down's instantiations
     return type == 8 || type == 10 || type == 11 || type == 12 || type == 13 || type == 14 || type == 16 || type == 17 ||
-           type == 18 || type == 19 || type == 21 || type == 22 || type == 23 || type == 29;
+           type == 18 || type == 19 || type == 21 || type == 22 || type == 23 || type == 29 || type == 40;
 }
 
 int launch_errors() { return g_launch_errors.load(std::memory_order_relaxed) + exl3::launch_errors(); }
@@ -5433,6 +5483,7 @@ size_t row_bytes(int type, int64_t n_in) {
     switch (type) {
         case kTypeF32: return (size_t) n_in * 4;
         case kTypeBF16: return (size_t) n_in * 2;
+        case 40: return (size_t) (n_in / 64) * sizeof(block_nvfp4);
         case 12: return (size_t) (n_in / 256) * sizeof(block_q4_K);
         case 13: return (size_t) (n_in / 256) * sizeof(block_q5_K);
         case 14: return (size_t) (n_in / 256) * sizeof(block_q6_K);
@@ -5541,7 +5592,7 @@ bool mv_rdna(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t s) {
     int acc = 0, m = 0, max_in = 0;
     for (const int T : {kTypeBF16, 14})
         for (int i = 0; i < n; ++i)
-            if (jobs[i].type == T) {
+            if (!done[i] && jobs[i].type == T) {
                 b.j[m] = jobs[i];
                 acc += (jobs[i].n_out + (T == 14 ? wpb * r : wpb) - 1) / (T == 14 ? wpb * r : wpb);
                 b.blk_end[m++] = acc;
@@ -5619,11 +5670,40 @@ static bool mv_inputs_ok(const MvJob* jobs, int n, const char* who) {
     for (int i = 0; i < n; ++i) {
         const MvJob& j = jobs[i];
         const bool fl = j.type == kTypeF32 || j.type == kTypeBF16;
-        if (j.type == exl3::kTypeEXL3 ? j.xf != nullptr || j.xq != nullptr : fl ? j.xf != nullptr : j.xq != nullptr)
+        if (j.type == exl3::kTypeEXL3 || fl ? j.xf != nullptr || j.xq != nullptr : j.xq != nullptr)
             continue;
         std::fprintf(stderr, "glm_fast %s: a type %d job without its %s activations\n", who, j.type,
                      fl ? "float" : "q8_1");
         return false;
+    }
+    return true;
+}
+
+// Floating-point weights with an existing q8_1 input use the generic kernel;
+// the optimized BF16 kernels expect an F32 input. nt=0 retains mv's column layout.
+static bool float_q8_jobs(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t s) {
+    for (int i = 0; i < n; ++i) {
+        const MvJob& j = jobs[i];
+        if (done[i] || (j.type != kTypeF32 && j.type != kTypeBF16) || j.xf != nullptr) continue;
+        if (j.n_in % 32 != 0) return false;
+        const int count = nt > 0 ? nt : j.ncol;
+        for (int base = 0; base < count; base += kMaxMvCols) {
+            MvBatch b{};
+            b.skip = g_skip;
+            b.n = 1;
+            b.j[0] = j;
+            b.j[0].ncol = std::min(kMaxMvCols, count - base);
+            if (nt > 0) {
+                b.j[0].xq_cstride = (j.n_in / 32) * sizeof(block_q8_1);
+                b.j[0].y_cstride = j.n_out;
+            }
+            b.j[0].xq = (const uint8_t*) j.xq + (size_t) base * b.j[0].xq_cstride;
+            b.j[0].y = j.y + (size_t) base * b.j[0].y_cstride;
+            b.blk_end[0] = (j.n_out + MV_ROWS - 1) / MV_ROWS;
+            if (b.j[0].ncol == 1) mv_kernel<<<b.blk_end[0], 256, 0, s>>>(b);
+            else mv_kernel_cols<<<b.blk_end[0], 256, 0, s>>>(b);
+        }
+        done[i] = true;
     }
     return true;
 }
@@ -5649,6 +5729,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     // EXL3 weights (w: an exl3::Mat): their own kernels, F32 input when the job has it, else the q8_1 - a job of
     // several columns (a verify window's tokens) as one EXL3 job a column
     if (!exl3_jobs(jobs, n, 0, done, s)) return false;
+    if (!float_q8_jobs(jobs, n, 0, done, s)) return false;
     {
         bool all = true;
         for (int i = 0; i < n; ++i) all = all && done[i];
@@ -5906,6 +5987,7 @@ bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
     static const bool typed = getenv("STRATA_GLM_MV_GENERIC") == nullptr;
     bool done[kMaxMvJobs] = {};
     if (!exl3_jobs(jobs, n, nt, done, s)) return false;   // (EXL3: one EXL3 job an activation)
+    if (!float_q8_jobs(jobs, n, nt, done, s)) return false;
     if (nt > 8) {
         // more activations than the kernels take (a verify window's rows, STRATA_GLM_MULTI_MTP): the rest in groups of
         // 8 - each activation's output is mv()'s for it alone either way (the EXL3 jobs above took all nt at once)
@@ -6881,7 +6963,7 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
         case T: moe_gate_up_kernel<T><<<grid, GU_WARPS * 32, gx, s>>>(d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, \
                                                                       n_ff_sh, sh_out); break;
         GLMF_GU(16) GLMF_GU(18) GLMF_GU(19) GLMF_GU(23) GLMF_GU(10) GLMF_GU(11) GLMF_GU(17) GLMF_GU(22) GLMF_GU(21) GLMF_GU(29)
-        GLMF_GU(12) GLMF_GU(13) GLMF_GU(14) GLMF_GU(8)
+        GLMF_GU(12) GLMF_GU(13) GLMF_GU(14) GLMF_GU(8) GLMF_GU(40)
 #undef GLMF_GU
         default: std::fprintf(stderr, "glm_fast moe_gate_up: type %d unsupported\n", gu_type); return;
     }
@@ -6987,7 +7069,7 @@ void moe_down(int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, size_
 #define GLMF_DN(T) \
         case T: moe_down_kernel<T><<<blocks, 256, 0, s>>>(d, k, n_embd, n_ff, down_off, H, sh_out, out); break;
         GLMF_DN(16) GLMF_DN(18) GLMF_DN(19) GLMF_DN(23) GLMF_DN(10) GLMF_DN(11) GLMF_DN(17) GLMF_DN(22) GLMF_DN(21) GLMF_DN(29)
-        GLMF_DN(12) GLMF_DN(13) GLMF_DN(14) GLMF_DN(8)
+        GLMF_DN(12) GLMF_DN(13) GLMF_DN(14) GLMF_DN(8) GLMF_DN(40)
 #undef GLMF_DN
         default: std::fprintf(stderr, "glm_fast moe_down: type %d unsupported\n", d_type); return;
     }

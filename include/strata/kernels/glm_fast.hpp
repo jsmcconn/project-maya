@@ -21,7 +21,7 @@ constexpr int kTypeF32 = 0;
 constexpr int kTypeBF16 = 30;
 
 /// y[r] = alpha * (W_r . x) + (bias ? bias[r] : 0) for r in [0, n_out).  Quantized types read
-/// `xq` (q8_1, n_in / 32 blocks); F32 / BF16 weights read `xf`.
+/// `xq` (q8_1, n_in / 32 blocks); F32 / BF16 weights read `xf`, or the existing `xq` when xf is null.
 ///
 /// `ncol` > 1: the same weights against that many activations (the tokens of a verify window, a draft block) -
 /// column c reads xq + c * xq_cstride bytes / xf + c * xf_cstride floats and writes y + c * y_cstride floats.  Each
@@ -29,7 +29,7 @@ constexpr int kTypeBF16 = 30;
 struct MvJob {
     const void* w = nullptr;
     const void* xq = nullptr;
-    const float* xf = nullptr;
+    const float* xf = nullptr;  // BF16/F32 weights may use xq when only the existing q8_1 activation is available
     float* y = nullptr;
     const float* bias = nullptr;
     float alpha = 1.0f;

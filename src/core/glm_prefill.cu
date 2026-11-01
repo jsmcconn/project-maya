@@ -1062,7 +1062,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
     size_t gstride = 0;
     std::string why;
     const auto deq_ok = [&](const WSlot& w, const char* nm, int il) {
-        if (w.q == nullptr || (w.type != gf::kTypeBF16 && w.type != strata::kernels::exl3::kTypeEXL3 &&
+        if (w.q == nullptr || (w.type != gf::kTypeF32 && w.type != gf::kTypeBF16 && w.type != strata::kernels::exl3::kTypeEXL3 &&
                                !strata::kernels::dequant_bf16_supported(w.type)))
             why += "blk." + std::to_string(il) + "." + nm + " (type " + std::to_string(w.type) + ") ";
     };
@@ -1086,7 +1086,8 @@ bool Glm5Model::prefill_setup(std::string& err) {
             deq_ok(Ly.sh_gate, "ffn_gate_shexp", il);
             deq_ok(Ly.sh_up, "ffn_up_shexp", il);
             deq_ok(Ly.sh_down, "ffn_down_shexp", il);
-            if (!Ly.exl3 && (!mmq::supported(Ly.gu_type) || !mmq::supported(Ly.d_type)))   // (EXL3: run_set_x3)
+            const bool nvfp4 = Ly.gu_type == 40 && Ly.d_type == 40 && mmq::to_f16_supported(40);
+            if (!Ly.exl3 && !nvfp4 && (!mmq::supported(Ly.gu_type) || !mmq::supported(Ly.d_type)))
                 why += "blk." + std::to_string(il) + " experts (types " + std::to_string(Ly.gu_type) + "/" +
                        std::to_string(Ly.d_type) + ") ";
             gstride = std::max(gstride, glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type));
@@ -2077,6 +2078,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const int n = std::min(rows, N - r0);
             if (w.type == gf::kTypeBF16)
                 gb::bf16_to_f16((const uint16_t*) w.q + (size_t) r0 * Kd, S->w16, (int64_t) n * Kd, s);
+            else if (w.type == gf::kTypeF32)
+                gb::f32_to_f16((const float*) w.q + (size_t) r0 * Kd, S->w16, (int64_t) n * Kd, s);
             else if (x3w)
                 strata::kernels::exl3::reconstruct_rows(
                     strata::kernels::exl3::view(*(const strata::kernels::exl3::Mat*) w.q, r0, n), S->w16, false, s);
@@ -3426,8 +3429,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             return blas_dev[dev] - 1;
 #endif
         }();
-        const bool use_blas = blas_rows > 0 && !Ly.exl3 && mmq::to_f16_supported(Ly.gu_type) &&
+        const bool nvfp4 = Ly.gu_type == 40 && Ly.d_type == 40;
+        const int q_blas_rows = nvfp4 ? 1 : blas_rows;
+        const bool use_blas = q_blas_rows > 0 && !Ly.exl3 && mmq::to_f16_supported(Ly.gu_type) &&
                               mmq::to_f16_supported(Ly.d_type) && S->w16_elems >= (int64_t) 2 * nff * E + E;
+        if (nvfp4 && !use_blas) {
+            err = "glm prefill: NVFP4 requires the native FP16 conversion and enough GEMM scratch";
+            return false;
+        }
         const auto run_blas_q = [&](const uint8_t* blob, int a, int nrows, int r0) {
             namespace x3 = strata::kernels::exl3;
             const int64_t wgu = (int64_t) 2 * nff * E, wdn = (int64_t) E * nff;
@@ -3445,6 +3454,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                      CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                         "gemm q gate/up");
             }
+            const float* scales = (const float*) (blob + Ly.down_off + Ly.dn_bytes);
+            if (nvfp4)
+                gb::nvfp4_scale_product(GU, (int64_t) nrows * E, E, scales, true, s);
             gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
             mmq::to_f16(Ly.d_type, blob + Ly.down_off, S->w16, wdn, s);
             uint16_t* H16 = S->w16 + wdn;
@@ -3456,18 +3468,21 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                      CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                         "gemm q down");
             }
+            if (nvfp4)
+                gb::nvfp4_scale_product(GU, (int64_t) nrows * E, E, scales, false, s);
         };
         // in set order: runs of lighter experts through MMQ (run_set over the run), the heavy ones alone through cuBLAS
         const auto run_set_q = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
                                    int r0) {
             for (int i = 0; i < n_exp;) {
                 const int rows = hb[i + 1] - hb[i];
-                if (rows >= blas_rows) {
+                if (rows == 0) { ++i; continue; }
+                if (rows >= q_blas_rows) {
                     run_blas_q(wbase + (size_t) i * stride, hb[i], rows, r0);
                     ++i;
                 } else {
                     int j = i + 1;
-                    while (j < n_exp && hb[j + 1] - hb[j] < blas_rows) ++j;
+                    while (j < n_exp && hb[j + 1] - hb[j] < q_blas_rows) ++j;
                     run_set(wbase + (size_t) i * stride, j - i, stride, d_bounds + i, hb + i, r0);
                     i = j;
                 }
@@ -3794,7 +3809,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         a[(size_t) t] = S->c_act.data() + (size_t) (b + t) * kA;
                         o[(size_t) t] = S->c_ff.data() + (size_t) (b + t) * nff;
                     }
-                    kc::native_gu_rows_split(nf, blob, blob + Ly.gu_bytes, a.data(), cnt, o.data(), r0, r0 + kGu,
+                    kc::native_gu_rows_split(nf.scaled(blob), blob, blob + Ly.gu_bytes, a.data(), cnt, o.data(), r0, r0 + kGu,
                                              g.swiglu_exp);
                 });
                 F->cpu_pool->run(cpu_nrows, [&](int r) {
@@ -3830,7 +3845,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         h[(size_t) t] = S->c_hq.data() + (size_t) (b + t) * kH;
                         o[(size_t) t] = S->out_h + (size_t) (b + t) * E;
                     }
-                    kc::native_down_rows_split(nf, down, h.data(), cnt, o.data(), r0, r0 + kDn);
+                    kc::native_down_rows_split(nf.scaled(cpu_set[(size_t) j].ram), down, h.data(), cnt, o.data(), r0, r0 + kDn);
                   });
                 };
                 const auto up = [&](int ra, int rb) {

@@ -2951,6 +2951,28 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                               : "NOT FOUND") + ")";
                     return false;
                 }
+                if (nl.fmt.nvfp4()) {
+                    const std::string sn = rn.substr(0, rn.size() - 6) + "scale";
+                    auto& scales = nl.nvfp4_scales[(size_t) ri];
+                    scales.assign((size_t) g_.n_expert, 1.f);
+                    const strata::TensorInfo* st = find_tensor(sn);
+                    if (st != nullptr) {
+                        if (st->type != GGML_TYPE_F32 || st->elements() != g_.n_expert) {
+                            err = "pack: invalid NVFP4 expert scale " + sn;
+                            return false;
+                        }
+                        const int ss = find_shard_of(sn);
+                        std::memcpy(scales.data(), pack_shards_[(size_t) ss].base + gfs[(size_t) ss]->data_start() + st->offset,
+                                    scales.size() * sizeof(float));
+                        for (float v : scales) if (!std::isfinite(v) || v < 0.f) {
+                            err = "pack: nonfinite or negative NVFP4 scale " + sn;
+                            return false;
+                        }
+                    } else if (find_tensor(rn.substr(0, rn.size() - 6) + "input_scale") != nullptr) {
+                        err = "pack: NVFP4 activation scale without weight scale " + sn;
+                        return false;
+                    }
+                }
             }
             pack_layers_[(size_t) layer] = std::move(nl);
         }
@@ -3042,6 +3064,11 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // so this is lossless; F32 expansion doubled their bytes and their read time) and does not upload
     // token_embd at all (the embedding row is dequantized on the host from the shard mapping)
     fast_mode_ = getenv("STRATA_GLM_SLOW") == nullptr;
+    if (!fast_mode_ && std::any_of(pack_layers_.begin(), pack_layers_.end(),
+                                 [](const NativeLayer& nl) { return nl.fmt.nvfp4(); })) {
+        err = "pack: NVFP4 experts require the fast path (unset STRATA_GLM_SLOW)";
+        return false;
+    }
     if (exl3_ && !fast_mode_) {
         err = "pack: an EXL3 model runs on the fast path only (unset MAYA_GLM_SLOW)";
         return false;
@@ -3194,6 +3221,9 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             }
             { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, raw.data(), (size_t) r.bytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
             w16_[r.name] = (const uint16_t*) ((uint8_t*) w_arena_ + at);
+            if (t->shape.size() == 2)
+                ws_map_[r.name] = strata::core::WSlot{nullptr, strata::kernels::glmf::kTypeBF16,
+                    w16_[r.name], (int64_t) t->shape[0], (int64_t) t->shape[1]};
             at += (r.bytes + 255u) & ~(uint64_t) 255u;
             continue;
         }
@@ -3268,7 +3298,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, host.data(), (size_t) n_f32 * 4,
                             cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
         w_[r.name] = (const float*) ((uint8_t*) w_arena_ + at);
-        ws_map_[r.name] = strata::core::WSlot{(const float*) ((uint8_t*) w_arena_ + at), 0, nullptr, 0, 0};
+        ws_map_[r.name] = strata::core::WSlot{(const float*) ((uint8_t*) w_arena_ + at), 0, nullptr,
+            (int64_t) t->shape[0], t->shape.size() > 1 ? (int64_t) t->shape[1] : 0};
         at += (n_f32 * 4 + 255u) & ~(uint64_t) 255u;
     }
     if (head_half_) {

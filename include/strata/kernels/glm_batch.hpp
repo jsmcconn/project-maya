@@ -139,6 +139,8 @@ void expert_scatter(const int* ids, const int* rank, const int* base, int n, int
                     cudaStream_t s);
 /// h[r][c] = silu(min(gu[r][c], limit)) * clamp(gu[r][n_ff + c], +-limit), rows of [gate | up].
 void swiglu_rows(const float* gu, float* h, int rows, int n_ff, float limit, cudaStream_t s, int ld_h = 0);
+/// Apply ModelOpt's original gate/up or down tensor scales to an FP32 product.
+void nvfp4_scale_product(float* y, int64_t n, int width, const float* scales, bool gate_up, cudaStream_t s);
 // (ld_h: h's row stride, n_ff when 0; h = gu with ld_h = 2 n_ff writes each row's result over its gate half)
 /// The same rows, FP16 out (the Volta grouped-WMMA down product's activations): h16's row stride ld_h halves.
 void swiglu_rows_h16(const float* gu, void* h16, int rows, int n_ff, float limit, cudaStream_t s, int ld_h = 0);
