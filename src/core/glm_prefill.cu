@@ -1085,8 +1085,9 @@ bool Glm5Model::prefill_setup(std::string& err) {
             deq_ok(Ly.sh_gate, "ffn_gate_shexp", il);
             deq_ok(Ly.sh_up, "ffn_up_shexp", il);
             deq_ok(Ly.sh_down, "ffn_down_shexp", il);
-            const bool nvfp4 = Ly.gu_type == 40 && Ly.d_type == 40 && mmq::to_f16_supported(40);
-            if (!Ly.exl3 && !nvfp4 && (!mmq::supported(Ly.gu_type) || !mmq::supported(Ly.d_type)))
+            const bool f16_experts = (Ly.gu_type == 40 || Ly.gu_type == gf::kTypeBF16) &&
+                                    Ly.gu_type == Ly.d_type && mmq::to_f16_supported(Ly.gu_type);
+            if (!Ly.exl3 && !f16_experts && (!mmq::supported(Ly.gu_type) || !mmq::supported(Ly.d_type)))
                 why += "blk." + std::to_string(il) + " experts (types " + std::to_string(Ly.gu_type) + "/" +
                        std::to_string(Ly.d_type) + ") ";
             gstride = std::max(gstride, glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type));
@@ -3421,11 +3422,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
 #endif
         }();
         const bool nvfp4 = Ly.gu_type == 40 && Ly.d_type == 40;
-        const int q_blas_rows = nvfp4 ? 1 : blas_rows;
+        const bool bf16 = Ly.gu_type == gf::kTypeBF16 && Ly.d_type == gf::kTypeBF16;
+        const int q_blas_rows = nvfp4 || bf16 ? 1 : blas_rows;
         const bool use_blas = q_blas_rows > 0 && !Ly.exl3 && mmq::to_f16_supported(Ly.gu_type) &&
                               mmq::to_f16_supported(Ly.d_type) && S->w16_elems >= (int64_t) 2 * nff * E + E;
-        if (nvfp4 && !use_blas) {
-            err = "glm prefill: NVFP4 requires the native FP16 conversion and enough GEMM scratch";
+        if ((nvfp4 || bf16) && !use_blas) {
+            err = "glm prefill: NVFP4/BF16 experts require native FP16 conversion and enough GEMM scratch";
             return false;
         }
         const auto run_blas_q = [&](const uint8_t* blob, int a, int nrows, int r0) {

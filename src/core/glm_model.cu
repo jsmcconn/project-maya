@@ -275,6 +275,14 @@ static const char* const kMtpF32[] = {"attn_norm.weight", "ffn_norm.weight", "at
                                       "indexer_compressor_ape.weight", "exp_probs_b.bias", "nextn.enorm.weight",
                                       "nextn.hnorm.weight", "nextn.shared_head_norm.weight"};
 
+// MTP checkpoints can preserve their dense projections as BF16/F32. They use
+// the fast projection kernels, not native_mmvq's quantized-weight dispatch.
+static size_t mtp_raw_bytes(const strata::TensorInfo* t) {
+    if (t->type == GGML_TYPE_BF16) return (size_t) t->elements() * 2;
+    if (t->type == GGML_TYPE_F32) return (size_t) t->elements() * 4;
+    return strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]);
+}
+
 // ... and the VRAM they take
 static bool mtp_dense_vram(const std::function<const strata::TensorInfo*(const std::string&)>& find, int il,
                            uint64_t& bytes, std::string& err) {
@@ -283,7 +291,7 @@ static bool mtp_dense_vram(const std::function<const strata::TensorInfo*(const s
     for (const char* n : kMtpRaw) {
         const strata::TensorInfo* t = find(P + n);
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
-        bytes += (strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]) + 255u) &
+        bytes += (mtp_raw_bytes(t) + 255u) &
                  ~(uint64_t) 255u;
     }
     for (const char* n : kMtpB16) {
@@ -3791,7 +3799,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
             continue;
         }
         const strata::TensorInfo* t = find(P + n, si);
-        const size_t nb = strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]);
+        const size_t nb = mtp_raw_bytes(t);
         if (cudaMemcpy(base + at, src_of(t, si), nb, cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: upload"; return false; }
         ws_map_[P + n] = strata::core::WSlot{nullptr, (int) t->type, (const void*) (base + at), (int64_t) t->shape[0],
                                              (int64_t) t->shape[1]};
