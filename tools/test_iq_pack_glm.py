@@ -55,6 +55,13 @@ class Nvfp4Dense(unittest.TestCase):
 
 
 class Glm5NextBf16List(unittest.TestCase):
+    def test_original_f32_parameters_are_not_rounded(self):
+        for suffix in ("ssm_a", "ssm_dt.bias", "hc_attn_base.weight", "hc_attn_scale.weight",
+                       "hc_ffn_base.weight", "hc_ffn_scale.weight", "exp_probs_b.bias",
+                       "indexer_compressor_ape.weight"):
+            self.assertFalse(iq_pack.needs_bf16("blk.0."+suffix,"F32","glm5-next"),suffix)
+        self.assertTrue(iq_pack.needs_bf16("blk.0.hc_attn_fn.weight","F32","glm5-next"))
+
     def test_glm5_mhc_names_preserved(self):
         for name in ("blk.0.hc_attn_fn.weight", "blk.3.hc_attn_base.weight", "blk.3.hc_attn_scale.weight",
                      "blk.3.hc_ffn_fn.weight", "blk.3.hc_ffn_base.weight", "blk.3.hc_ffn_scale.weight"):
