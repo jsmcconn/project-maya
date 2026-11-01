@@ -95,6 +95,9 @@ void iq512_rows(int, const uint8_t*, size_t, int, const void* const*, int, float
     unsupported("the AVX-512 i-quant kernel");
 }
 void iq512_set_q5k_fused(bool) noexcept {}
+void nvfp4_512_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
+    unsupported("the AVX-512 NVFP4 kernel");
+}
 
 bool iq256_supported(int) noexcept { return false; }
 void iq256_gu_rows(int, const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int, int) {

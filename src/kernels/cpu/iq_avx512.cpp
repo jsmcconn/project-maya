@@ -20,6 +20,9 @@
 #include <immintrin.h>
 
 #include <atomic>
+#include <array>
+#include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -403,6 +406,72 @@ void iq512_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
         IQ512_TYPES(CASE)
 #undef CASE
         default: break;
+    }
+}
+
+namespace {
+
+// Unsigned E4M3, halved for ggml's doubled E2M1 codebook. Keep the reserved 0x7f zero.
+constexpr std::array<float, 256> nv4_scales = [] {
+    std::array<float, 256> a{};
+    for (unsigned i = 0; i < a.size(); ++i) {
+        const unsigned e = (i >> 3) & 15, m = i & 7;
+        a[i] = i == 127 ? 0.f : e ? std::bit_cast<float>(((e + 119) << 23) | (m << 20)) : m / 1024.f;
+    }
+    return a;
+}();
+
+template<int NT>
+void nv4_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out,
+              int r0, int r1) {
+    const __m256i lut = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*) kvalues_fp4));
+    const __m256i mask = _mm256_set1_epi8(15);
+    const __m512i order = _mm512_set_epi64(7, 3, 6, 2, 5, 1, 4, 0);
+    const __m512i ones = _mm512_set1_epi16(1);
+    for (int r = r0; r < r1; ++r) {
+        const auto* row = (const block_nvfp4*) (w + (size_t) r * row_bytes);
+        __m256 acc[NT];
+        for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
+        for (int ib = 0; ib < n / QK_NVFP4; ++ib) {
+            const __m256i bits = _mm256_loadu_si256((const __m256i*) row[ib].qs);
+            const __m256i lo = _mm256_shuffle_epi8(lut, _mm256_and_si256(bits, mask));
+            const __m256i hi = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(bits, 4), mask));
+            const __m512i codes = _mm512_permutexvar_epi64(order,
+                _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1));
+            const __m512i magnitudes = _mm512_abs_epi8(codes);
+            const __mmask64 negative = _mm512_movepi8_mask(codes);
+            for (int t = 0; t < NT; ++t) {
+                const auto* y = (const block_q8_0*) act[t];
+                const __m256i q0 = _mm256_loadu_si256((const __m256i*) y[2*ib].qs);
+                const __m256i q1 = _mm256_loadu_si256((const __m256i*) y[2*ib+1].qs);
+                const __m512i q = _mm512_inserti64x4(_mm512_castsi256_si512(q0), q1, 1);
+                const __m512i signed_q = _mm512_mask_sub_epi8(q, negative, _mm512_setzero_si512(), q);
+                const __m512i p = _mm512_madd_epi16(_mm512_maddubs_epi16(magnitudes, signed_q), ones);
+                const float dy0 = h2f(y[2*ib].d), dy1 = h2f(y[2*ib+1].d);
+                const __m256 s0 = _mm256_set_m128(_mm_set1_ps(nv4_scales[row[ib].d[1]] * dy0),
+                                                  _mm_set1_ps(nv4_scales[row[ib].d[0]] * dy0));
+                const __m256 s1 = _mm256_set_m128(_mm_set1_ps(nv4_scales[row[ib].d[3]] * dy1),
+                                                  _mm_set1_ps(nv4_scales[row[ib].d[2]] * dy1));
+                acc[t] = _mm256_fmadd_ps(s0, _mm256_cvtepi32_ps(_mm512_castsi512_si256(p)), acc[t]);
+                acc[t] = _mm256_fmadd_ps(s1, _mm256_cvtepi32_ps(_mm512_extracti64x4_epi64(p, 1)), acc[t]);
+            }
+        }
+        for (int t = 0; t < NT; ++t) out[t][r] = hsum_ggml(acc[t]);
+    }
+}
+
+} // namespace
+
+void nvfp4_512_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                    float* const* out, int r0, int r1) {
+    switch (nt) {
+        case 0: break;
+        case 1: nv4_rows<1>(w, row_bytes, n, act, out, r0, r1); break;
+        case 2: nv4_rows<2>(w, row_bytes, n, act, out, r0, r1); break;
+        case 3: nv4_rows<3>(w, row_bytes, n, act, out, r0, r1); break;
+        case 4: nv4_rows<4>(w, row_bytes, n, act, out, r0, r1); break;
+        default: for (int t = 0; t < nt; t += 4)
+            nvfp4_512_rows(type, w, row_bytes, n, act+t, std::min(4, nt-t), out+t, r0, r1);
     }
 }
 

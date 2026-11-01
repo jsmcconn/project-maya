@@ -262,6 +262,39 @@ void check_split(int type, std::mt19937& rng) {
     if (!gu_same || !dn_same) ++failures;
 }
 
+// NVFP4 uses Q8_0 rather than the IQ formats' Q8_K. Exercise every scale byte,
+// padding, empty/partial row ranges and the four-token grouping remainder.
+void check_nv4(std::mt19937& rng) {
+    constexpr int rows = 9;
+    const auto* tr = ggml_get_type_traits_cpu(GGML_TYPE_NVFP4);
+    const auto* at = ggml_get_type_traits_cpu(tr->vec_dot_type);
+    for (int n : {64, 128, 2048, 4096}) for (int nt : {1, 2, 4, 5, 11, 16}) {
+        const size_t rb = ggml_row_size(GGML_TYPE_NVFP4, n), stride = rb + 16;
+        const size_t bb = ggml_type_size(GGML_TYPE_NVFP4), ab = ggml_row_size(tr->vec_dot_type, n);
+        std::vector<uint8_t> w(stride * rows), a(ab * nt);
+        for (auto& v : w) v = (uint8_t) rng();
+        for (int r = 0; r < rows; ++r) for (size_t b = 0; b < rb / bb; ++b)
+            for (int j = 0; j < 4; ++j) w[stride*r + bb*b + j] = (uint8_t) ((r*(rb/bb)+b)*4+j);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        std::vector<float> x(n), got((size_t) nt * rows, -12345.f), ref(got);
+        std::vector<const void*> ap(nt);
+        std::vector<float*> op(nt);
+        for (int t = 0; t < nt; ++t) {
+            for (auto& v : x) v = nd(rng);
+            at->from_float(x.data(), a.data()+ab*t, n);
+            ap[t] = a.data()+ab*t; op[t] = got.data()+rows*t;
+            for (int r = 2; r < 7; ++r)
+                tr->vec_dot(n, &ref[(size_t)t*rows+r], 0, w.data()+stride*r, 0, ap[t], 0, 1);
+        }
+        cpu::nvfp4_512_rows(GGML_TYPE_NVFP4, w.data(), stride, n, ap.data(), nt, op.data(), 2, 7);
+        cpu::nvfp4_512_rows(GGML_TYPE_NVFP4, w.data(), stride, n, ap.data(), nt, op.data(), 3, 3);
+        if (std::memcmp(got.data(), ref.data(), got.size()*sizeof(float))) {
+            std::printf("  NVFP4 AVX-512 differs: width %d tokens %d\n", n, nt); ++failures;
+        }
+    }
+    std::printf("  NVFP4 AVX-512 independent ggml dot and row-bound checks finished\n");
+}
+
 }  // namespace
 
 int main() {
@@ -271,6 +304,7 @@ int main() {
                          GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ1_M};
     const bool avx512 = cpu::cpu_avx512bw_ok(), avx2 = cpu::cpu_avx2_ok();
     std::printf("native_rows_exact_test: AVX-512BW %s, AVX2 %s\n", avx512 ? "yes" : "no", avx2 ? "yes" : "no");
+    if (avx512) check_nv4(rng);
     for (int t : types) {
         if (avx512 && cpu::iq512_supported(t)) check_kernel("avx512", cpu::iq512_rows, cpu::iq512_set_q5k_fused, t, rng);
         if (avx2) check_kernel("avx2", cpu::iq256_rows, cpu::iq256_set_q5k_fused, t, rng);

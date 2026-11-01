@@ -116,7 +116,9 @@ RowsFn pick_rows(int type) {
     const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;
     RowsFn fn = nullptr;
     void (*set_q5k)(bool) noexcept = nullptr;
-    if (avx2 && type == GGML_TYPE_NVFP4) {
+    if (avx512 && type == GGML_TYPE_NVFP4) {
+        fn = nvfp4_512_rows;
+    } else if (avx2 && type == GGML_TYPE_NVFP4) {
         fn = nvfp4_256_rows;
     } else if (avx512 && iq512_supported(type)) {
         fn = iq512_rows;

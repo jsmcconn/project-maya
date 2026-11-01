@@ -19,4 +19,8 @@ void iq512_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const 
 /// then an add (MSVC's) - set from native_expert.cpp's check against this build's ggml-cpu.
 void iq512_set_q5k_fused(bool fused) noexcept;
 
+/// NVFP4 codes/scales against Q8_0, with ggml's original floating-point accumulation order.
+void nvfp4_512_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                    float* const* out, int r0, int r1);
+
 }  // namespace strata::kernels::cpu
