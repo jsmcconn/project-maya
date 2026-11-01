@@ -738,6 +738,55 @@ void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
     }
 }
 
+// ggml's UE4M3 scale is halved because kvalues_fp4 contains doubled E2M1 values.
+static float nv4_scale(uint8_t x) {
+    if (x == 127) return 0.f;
+    const unsigned e = (x >> 3) & 15, m = x & 7;
+    if (!e) return (float) m * (1.f / 1024.f);
+    const uint32_t bits = ((e + 119) << 23) | (m << 20);
+    float f; std::memcpy(&f, &bits, sizeof f); return f;
+}
+
+void nvfp4_256_rows(int, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                    float* const* out, int r0, int r1) {
+    const __m128i values = _mm_loadu_si128((const __m128i*) kvalues_fp4);
+    const __m128i mask = _mm_set1_epi8(15);
+    const __m256i ones = _mm256_set1_epi16(1);
+    for (int r = r0; r < r1; ++r) for (int t0 = 0; t0 < nt; t0 += 4) {
+        const int count = nt - t0 < 4 ? nt - t0 : 4;
+        const auto* row = (const block_nvfp4*) (w + (size_t) r * row_bytes);
+        __m256 acc[4];
+        for (int t = 0; t < count; ++t) acc[t] = _mm256_setzero_ps();
+        for (int ib = 0; ib < n / QK_NVFP4; ++ib) {
+            __m256i codes[2], abs_codes[2];
+            for (int j = 0; j < 2; ++j) {
+                const __m128i bits = _mm_loadu_si128((const __m128i*) (row[ib].qs + 16*j));
+                const __m128i lo = _mm_shuffle_epi8(values, _mm_and_si128(bits, mask));
+                const __m128i hi = _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(bits, 4), mask));
+                codes[j] = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_unpacklo_epi64(lo, hi)),
+                                                  _mm_unpackhi_epi64(lo, hi), 1);
+                abs_codes[j] = _mm256_sign_epi8(codes[j], codes[j]);
+            }
+            float scales[4];
+            for (int j = 0; j < 4; ++j) scales[j] = nv4_scale(row[ib].d[j]);
+            for (int t = 0; t < count; ++t) {
+                const auto* y = (const block_q8_0*) act[t0+t];
+                for (int j = 0; j < 2; ++j) {
+                    const auto& b = y[2*ib+j];
+                    const __m256i q = _mm256_loadu_si256((const __m256i*) b.qs);
+                    const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(abs_codes[j],
+                                                       _mm256_sign_epi8(q, codes[j])), ones);
+                    const float dy = h2f(b.d);
+                    const __m256 s = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_set1_ps(scales[2*j]*dy)),
+                                                         _mm_set1_ps(scales[2*j+1]*dy), 1);
+                    acc[t] = _mm256_fmadd_ps(s, _mm256_cvtepi32_ps(p), acc[t]);
+                }
+            }
+        }
+        for (int t = 0; t < count; ++t) out[t0+t][r] = hsum_ggml(acc[t]);
+    }
+}
+
 // ---- IQ4_NL (type 20): 32-value blocks of 18 bytes (f16 d + 16 nibble bytes) against Q8_0 activations.
 // ggml-cpu's own AVX-2 dot (ggml_vec_dot_iq4_nl_q8_0) is single-token: every token redoes the nibble ->
 // kvalues_iq4nl pshufb decode and the |w| half of the signed x signed product.  Here both are computed once

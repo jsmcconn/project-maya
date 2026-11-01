@@ -53,7 +53,9 @@ bool rows_match_ggml(RowsFn fn, int type, std::initializer_list<int> nts = {2, 5
     for (auto& b : w) b = (uint8_t) next();
     for (size_t o = 0; o < w.size(); o += bb) {
         const ggml_fp16_t d = ggml_fp32_to_fp16(0.002f + 0.001f * (float) (next() % 16));
-        if (t == GGML_TYPE_IQ1_M) {
+        if (t == GGML_TYPE_NVFP4) {
+            for (int j = 0; j < 4; ++j) w[o + j] = (uint8_t) (next() % 128);
+        } else if (t == GGML_TYPE_IQ1_M) {
             // Its FP16 scale is embedded in four high nibbles, not at the block's start.
             for (int j = 0; j < 4; ++j) {
                 uint16_t word;
@@ -114,7 +116,9 @@ RowsFn pick_rows(int type) {
     const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;
     RowsFn fn = nullptr;
     void (*set_q5k)(bool) noexcept = nullptr;
-    if (avx512 && iq512_supported(type)) {
+    if (avx2 && type == GGML_TYPE_NVFP4) {
+        fn = nvfp4_256_rows;
+    } else if (avx512 && iq512_supported(type)) {
         fn = iq512_rows;
         set_q5k = iq512_set_q5k_fused;
     } else if (avx2 && iq256_supported(type)) {

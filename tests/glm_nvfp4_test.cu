@@ -141,4 +141,4 @@ static void window_case(int gpu) {
     }
     for(auto p:experts)ck(cudaFree(p));ck(cudaDeviceSynchronize());req(gf::launch_errors()==0,"window launch errors");std::printf("GPU %d NVFP4 grouped window bit-exact PASS\n",gpu);
 }
-int main(){ int n=0; ck(cudaGetDeviceCount(&n));req(n>0,"GPU required");for(int i=0;i<n;++i){run(i);bf16_expert(i);window_case(i);} }
+int main(){ req(kc::native_multi_rows_exact(40),"NVFP4 multi-token rows must match ggml exactly"); int n=0; ck(cudaGetDeviceCount(&n));req(n>0,"GPU required");for(int i=0;i<n;++i){run(i);bf16_expert(i);window_case(i);} }
