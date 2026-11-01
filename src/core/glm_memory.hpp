@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <limits>
@@ -9,6 +10,24 @@
 #include <vector>
 
 namespace strata::core::glmfast {
+
+// CUDA-visible device overrides win over the caller's global/later-GPU fallback.
+inline const char* expert_pool_reserve_env(int device, const char* fallback) {
+    char key[64];
+    std::snprintf(key, sizeof key, "STRATA_GLM_RESERVE_MB_%d", device);
+    if (const char* per_device = std::getenv(key)) return per_device;
+    return fallback;
+}
+
+// Keep a fixed expert-cache ceiling when the desktop's allocations change.
+inline size_t expert_pool_cap(size_t available, int device) {
+    const char* value = std::getenv("STRATA_GLM_POOL_GB");
+    char key[64];
+    std::snprintf(key, sizeof key, "STRATA_GLM_POOL_GB_%d", device);
+    if (const char* per_device = std::getenv(key)) value = per_device;
+    return value ? std::min(available, (size_t) (std::atof(value) * 1073741824.0)) : available;
+}
+
 
 // The all-resident launch skip (STRATA_GLM_RESIDENT_SKIP; the complete pool was here too until v1.1.35): on by
 // default on AMD, where the Strix / Gorgon Halo APUs hold every expert (measured there); an NVIDIA build launches
