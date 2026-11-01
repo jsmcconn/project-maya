@@ -1,0 +1,98 @@
+// Original NVFP4 blocks + distinct ModelOpt tensor scales against ggml's independent
+// dequantizer and double-precision dots. Exercise CPU, GPU decode and FP16 prefill.
+#include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/glm_batch.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/prefill/moe_mmq.hpp"
+#include "ggml.h"
+#include <cublas_v2.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+namespace gf = strata::kernels::glmf;
+namespace gb = strata::kernels::glmb;
+namespace kc = strata::kernels::cpu;
+namespace mq = strata::prefill::mmq;
+static void ck(cudaError_t e) { if(e != cudaSuccess) { std::fprintf(stderr,"CUDA: %s\n",cudaGetErrorString(e)); std::exit(1); } }
+static void req(bool b, const char* s) { if(!b) { std::fprintf(stderr,"FAIL: %s\n",s); std::exit(1); } }
+template<class T> static T* dev(const T* p, size_t n) { T* q; ck(cudaMalloc(&q,n*sizeof(T))); if(p) ck(cudaMemcpy(q,p,n*sizeof(T),cudaMemcpyHostToDevice)); return q; }
+template<class T> static std::vector<T> read(const T* p, size_t n) { std::vector<T> h(n); ck(cudaMemcpy(h.data(),p,n*sizeof(T),cudaMemcpyDeviceToHost)); return h; }
+static std::vector<float> q8read(const uint8_t* p,int n) {
+    auto b=read(p,(size_t)n/32*36); std::vector<float> f(n);
+    for(int i=0;i<n;++i) { uint16_t h; std::memcpy(&h,b.data()+(i/32)*36,2); f[i]=ggml_fp16_to_fp32(h)*(int8_t)b[(i/32)*36+4+i%32]; } return f;
+}
+static float silu(float g,float u) { g=std::min(g,.7f); u=std::clamp(u,-.7f,.7f); return g/(1.f+std::exp(-g))*u; }
+static std::vector<float> product(const float* w,const float* x,int rows,int cols,float scale) {
+    std::vector<float> y(rows); for(int r=0;r<rows;++r) { double v=0; for(int c=0;c<cols;++c) v+=(double)w[r*cols+c]*x[c]; y[r]=(float)v*scale; } return y;
+}
+static void near(const std::vector<float>& a,const std::vector<float>& b,float tol,const char* name) {
+    double worst=0,ref=0; req(a.size()==b.size(),"shape");
+    for(size_t i=0;i<a.size();++i) { req(std::isfinite(a[i]),name); worst=std::max(worst,(double)std::abs(a[i]-b[i])); ref=std::max(ref,(double)std::abs(b[i])); }
+    std::printf("%s max_abs %.9g ref %.9g\n",name,worst,ref); req(worst<=tol*(1+ref),name);
+}
+static void run(int gpu) {
+    ck(cudaSetDevice(gpu)); constexpr int E=256,F=128; std::string err; kc::NativeFmt nf;
+    req(kc::native_fmt(40,40,E,F,nf,err),err.c_str());
+    const size_t raw=nf.bytes-12; std::vector<uint8_t> b(nf.bytes); uint32_t seed=17;
+    for(size_t i=0;i<raw;i+=36) {
+        const uint8_t scales[]={0,1,7,8,24,40,56,63};
+        for(int j=0;j<4;++j) b[i+j]=scales[(i/36+j)%8];
+        for(int j=4;j<36;++j) { seed=1664525*seed+1013904223; b[i+j]=(uint8_t)(seed>>24); }
+    }
+    std::vector<float> w(raw/36*64); ggml_get_type_traits(GGML_TYPE_NVFP4)->to_float(b.data(),w.data(),w.size());
+    std::vector<float> x(E); for(int i=0;i<E;++i) x[i]=std::sin(i*.31f)*.8f;
+    float* dx=dev(x.data(),x.size()); uint8_t* xq=dev<uint8_t>(nullptr,E/32*36);
+    gf::quantize_q8_1(dx,xq,E,nullptr); auto xgpu=q8read(xq,E);
+    for(const auto& scales: {std::vector<float>{.25f,1.5f,.0625f},std::vector<float>{1,1,1},std::vector<float>{0,1,0}}) {
+        std::memcpy(b.data()+raw,scales.data(),12); const auto sf=nf.scaled(b.data());
+        std::vector<uint8_t> aq(nf.act_bytes),hq(nf.h_bytes); std::vector<float> xc(E),hc(F),yc(E);
+        kc::native_quant_act(nf,x.data(),aq.data()); ggml_get_type_traits((ggml_type)nf.gu_act)->to_float(aq.data(),xc.data(),E);
+        const void* ap=aq.data(); float* hp=hc.data(); kc::native_gu_rows_split(sf,b.data(),b.data()+nf.up_off,&ap,1,&hp,0,F,.7f);
+        auto g=product(w.data(),xc.data(),F,E,scales[0]),u=product(w.data()+F*E,xc.data(),F,E,scales[1]);
+        std::vector<float> hr(F); for(int i=0;i<F;++i) hr[i]=silu(g[i],u[i]); near(hc,hr,2e-5f,"CPU GU scale before clamp");
+        kc::native_quant_h(nf,hc.data(),hq.data()); std::vector<float> hdec(F); ggml_get_type_traits((ggml_type)nf.d_act)->to_float(hq.data(),hdec.data(),F);
+        const void* hqp=hq.data(); float* yp=yc.data(); kc::native_down_rows_split(sf,b.data()+nf.down_off,&hqp,1,&yp,0,E);
+        near(yc,product(w.data()+2*F*E,hdec.data(),E,F,scales[2]),2e-5f,"CPU down scale");
+        uint8_t* db=dev(b.data(),b.size()); unsigned long long ptrs[8]={(unsigned long long)db}; float weights[8]={.75f}; int zero=0;
+        gf::MoeDev m; m.plan_ptr=dev(ptrs,8); m.plan_w=dev(weights,8); m.cpu_flag=dev(&zero,1);
+        auto dh=dev<uint8_t>(nullptr,F/32*36*8); auto dy=dev<float>(nullptr,E);
+        gf::moe_gate_up(40,m,1,E,F,.7f,xq,dh,nullptr,0,nullptr,0,nullptr,nullptr);
+        auto hg=q8read(dh,F); g=product(w.data(),xgpu.data(),F,E,scales[0]); u=product(w.data()+F*E,xgpu.data(),F,E,scales[1]);
+        for(int i=0;i<F;++i) hr[i]=silu(g[i],u[i]); near(hg,hr,.008f,"GPU GU including Q8 rounding");
+        gf::moe_down(40,m,1,E,F,nf.down_off,dh,nullptr,dy,nullptr);
+        near(read(dy,E),product(w.data()+2*F*E,hg.data(),E,F,scales[2]*.75f),2e-5f,"GPU NVFP4 down dot");
+        // Production prefill operations: exact block -> FP16, FP32 accumulating GEMM,
+        // tensor scales before SwiGLU, FP16 H, down GEMM then down tensor scale.
+        req(mq::to_f16_supported(40),"NVFP4 FP16 converter");
+        auto dw=dev<uint16_t>(nullptr,w.size()); mq::to_f16(40,db,dw,w.size(),nullptr);
+        std::vector<uint16_t> x16(E); for(int i=0;i<E;++i) x16[i]=ggml_fp32_to_fp16(x[i]);
+        auto d16=dev(x16.data(),x16.size()); auto gu=dev<float>(nullptr,2*F); auto hh=dev<float>(nullptr,F);
+        cublasHandle_t handle; req(cublasCreate(&handle)==CUBLAS_STATUS_SUCCESS,"cublas create"); float one=1,zz=0;
+        req(cublasGemmEx(handle,CUBLAS_OP_T,CUBLAS_OP_N,2*F,1,E,&one,dw,CUDA_R_16F,E,d16,CUDA_R_16F,E,&zz,gu,CUDA_R_32F,2*F,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP)==CUBLAS_STATUS_SUCCESS,"GU gemm");
+        auto ds=(const float*)(db+raw); gb::nvfp4_scale_product(gu,2*F,2*F,ds,true,nullptr); gb::swiglu_rows(gu,hh,1,F,.7f,nullptr);
+        auto h=read(hh,F); std::vector<float> xr(E); for(int i=0;i<E;++i) xr[i]=ggml_fp16_to_fp32(x16[i]);
+        g=product(w.data(),xr.data(),F,E,scales[0]); u=product(w.data()+F*E,xr.data(),F,E,scales[1]); for(int i=0;i<F;++i) hr[i]=silu(g[i],u[i]); near(h,hr,2e-5f,"prefill GU scale before clamp");
+        std::vector<uint16_t> h16(F); for(int i=0;i<F;++i) { h16[i]=ggml_fp32_to_fp16(h[i]); h[i]=ggml_fp16_to_fp32(h16[i]); } auto hd=dev(h16.data(),h16.size());
+        req(cublasGemmEx(handle,CUBLAS_OP_T,CUBLAS_OP_N,E,1,F,&one,dw+2*F*E,CUDA_R_16F,F,hd,CUDA_R_16F,F,&zz,dy,CUDA_R_32F,E,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP)==CUBLAS_STATUS_SUCCESS,"down gemm");
+        gb::nvfp4_scale_product(dy,E,E,ds,false,nullptr); near(read(dy,E),product(w.data()+2*F*E,h.data(),E,F,scales[2]),2e-5f,"prefill down scale");
+        cublasDestroy(handle); for(void* p:{(void*)db,(void*)m.plan_ptr,(void*)m.plan_w,(void*)m.cpu_flag,(void*)dh,(void*)dy,(void*)dw,(void*)d16,(void*)gu,(void*)hh,(void*)hd}) ck(cudaFree(p));
+    }
+    // Float weight fallback must consume the existing Q8_1 activations without
+    // dereferencing a missing F32 input; cover both batching entry points.
+    for(int type:{gf::kTypeF32,gf::kTypeBF16}) for(int cols:{1,3,16}) {
+        constexpr int R=19; std::vector<float> wf(E*R); for(int i=0;i<E*R;++i) wf[i]=std::cos(i*.77f)*.03f;
+        std::vector<uint16_t> bf(E*R); for(int i=0;i<E*R;++i) { bf[i]=ggml_fp32_to_bf16(wf[i]).bits; if(type==gf::kTypeBF16) { uint32_t bits=(uint32_t)bf[i]<<16; std::memcpy(&wf[i],&bits,4); } }
+        void* ww=type==gf::kTypeF32?(void*)dev(wf.data(),wf.size()):(void*)dev(bf.data(),bf.size());
+        std::vector<uint8_t> acts((size_t)cols*E/32*36); auto single=read(xq,E/32*36); for(int t=0;t<cols;++t) std::memcpy(acts.data()+t*single.size(),single.data(),single.size());
+        auto da=dev(acts.data(),acts.size()); auto out=dev<float>(nullptr,R*cols); gf::MvJob j; j.w=ww;j.xq=da;j.type=type;j.n_in=E;j.n_out=R;j.y=out;j.ncol=cols;j.xq_cstride=single.size();j.y_cstride=R;
+        auto ref=product(wf.data(),xgpu.data(),R,E,1); std::vector<float> refs; for(int t=0;t<cols;++t) refs.insert(refs.end(),ref.begin(),ref.end());
+        req(gf::mv(&j,1,nullptr),"float Q8 mv"); near(read(out,R*cols),refs,2e-5f,"float Q8 columns"); j.ncol=1;
+        req(gf::mv_nt(&j,1,cols,nullptr),"float Q8 mv_nt"); near(read(out,R*cols),refs,2e-5f,"float Q8 mv_nt");
+        ck(cudaFree(ww));ck(cudaFree(da));ck(cudaFree(out));
+    }
+    ck(cudaFree(dx));ck(cudaFree(xq)); ck(cudaDeviceSynchronize()); req(gf::launch_errors()==0,"launch errors"); std::printf("GPU %d NVFP4 PASS\n",gpu);
+}
+int main(){ int n=0; ck(cudaGetDeviceCount(&n));req(n>0,"GPU required");for(int i=0;i<n;++i)run(i); }

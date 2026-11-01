@@ -20,10 +20,38 @@ from __future__ import annotations
 import pathlib
 import sys
 import unittest
+from types import SimpleNamespace
+import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import iq_pack  # noqa: E402
+
+
+class Nvfp4Dense(unittest.TestCase):
+    def model(self, scale=.25):
+        # Four 16-value groups: separate low/high halves of each group's bytes.
+        raw = np.array([0, 1, 56, 63] + [i | ((15-i) << 4) for _ in range(4) for i in range(8)], dtype=np.uint8)
+        tensors = {"blk.0.ffn_gate.weight": ("NVFP4", raw),
+                   "blk.0.ffn_gate.scale": ("F32", np.array([scale], dtype="<f4").view(np.uint8))}
+        return SimpleNamespace(where={n: (None, SimpleNamespace(type_name=t), None, None) for n,(t,b) in tensors.items()},
+                               bytes=lambda n: tensors[n][1])
+
+    def test_original_codebook_and_global_scale(self):
+        actual = np.frombuffer(iq_pack.nvfp4_dense_bytes(self.model(), "blk.0.ffn_gate.weight"), dtype="<f4")
+        codebook = np.array([0,.5,1,1.5,2,3,4,6,0,-.5,-1,-1.5,-2,-3,-4,-6], dtype=np.float32)
+        values = codebook[list(range(8)) + list(range(15,7,-1))]
+        expected = np.concatenate([values*s*.25 for s in [0,1/512,1,1.875]])
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_invalid_global_scales_fail_closed(self):
+        for value in [-1, np.nan, np.inf]:
+            with self.assertRaises(ValueError):
+                iq_pack.nvfp4_dense_bytes(self.model(value), "blk.0.ffn_gate.weight")
+
+    def test_missing_weight_scale_with_activation_scale_fails_closed(self):
+        m=self.model(); m.where.pop("blk.0.ffn_gate.scale"); m.where["blk.0.ffn_gate.input_scale"] = None
+        with self.assertRaises(ValueError): iq_pack.nvfp4_dense_bytes(m,"blk.0.ffn_gate.weight")
 
 
 class Glm5NextBf16List(unittest.TestCase):

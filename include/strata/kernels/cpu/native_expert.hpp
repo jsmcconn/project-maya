@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <string>
 
@@ -36,6 +37,19 @@ struct NativeFmt {
     int u_type = -1;
     size_t u_row = 0;
     bool mixed() const { return u_type >= 0 && u_type != gu_type; }
+    float gate_scale = 1.f, up_scale = 1.f, down_scale = 1.f;
+    bool nvfp4() const { return gu_type == 40 || d_type == 40; }
+    /// Maya's NVFP4 cache blobs append the three original F32 tensor scales.
+    /// GGUF source blocks remain unchanged; call only on an assembled cache blob.
+    NativeFmt scaled(const uint8_t* blob) const {
+        NativeFmt f = *this;
+        if (nvfp4()) {
+            float scales[3];
+            std::memcpy(scales, blob + down_off + d_row * (size_t) n_embd, sizeof scales);
+            f.gate_scale = scales[0]; f.up_scale = scales[1]; f.down_scale = scales[2];
+        }
+        return f;
+    }
 };
 
 /// Whether this build has the ggml-cpu path.
