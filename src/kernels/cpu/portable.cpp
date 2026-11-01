@@ -104,6 +104,9 @@ void iq256_rows(int, const uint8_t*, size_t, int, const void* const*, int, float
     unsupported("the AVX-2 i-quant kernel");
 }
 void iq256_set_q5k_fused(bool) noexcept {}
+void nvfp4_256_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
+    unsupported("the AVX-2 NVFP4 kernel");
+}
 bool iq256_rows1_supported(int) noexcept { return false; }
 void iq256_rows1(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
     unsupported("the AVX-2 one-token i-quant kernel");

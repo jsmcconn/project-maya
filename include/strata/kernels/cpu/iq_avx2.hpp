@@ -18,6 +18,9 @@ void iq256_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_
 /// out[t][r] = w_r . a[t], rows [r0, r1).
 void iq256_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                 float* const* out, int r0, int r1);
+/// NVFP4 against Q8_0; share E2M1 decoding across tokens, keeping ggml's float operation order.
+void nvfp4_256_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                    float* const* out, int r0, int r1);
 /// See iq512_set_q5k_fused.
 void iq256_set_q5k_fused(bool fused) noexcept;
 
