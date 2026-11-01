@@ -581,3 +581,38 @@ Keep the verified runner math (mHC/KDA/DSA/hc kernels) and teach it to serve the
 The full production-driver graph path (captured graphs, the server, the glm5-next WeightTable
 in layout.cpp) stays a later milestone; the layout tables are qwen4exp-specific down to the
 tensor names.
+
+## ModelOpt NVFP4 packs
+
+`tools/iq_pack.py` accepts losslessly repacked GGUF NVFP4 routed experts (type
+40). Gate, up and down must all be NVFP4. Their original GGUF blocks stay
+unchanged; runtime expert blobs append three F32 tensor scales, in gate/up/down
+order. The reader validates per-expert `.scale` sidecars and applies them to
+products before SwiGLU/clamping, and before combining the down result. A normal
+NVFP4 GGUF without sidecars uses unit tensor scales; an activation sidecar without
+its corresponding weight scale is rejected. `--experts-bin` and the slow GLM
+path are unsupported for these packs.
+
+The CPU uses ggml's NVFP4/Q8_0 dot product. GPU decode uses NVFP4/Q8_1 dots;
+GPU prefill decodes the original blocks to FP16 and uses FP32 accumulating
+cuBLAS products. All nonempty NVFP4 expert groups use this prefill path, including
+single-row groups. Dense NVFP4 matrices are decoded to F32 with their tensor
+scale in `dense.bin`. Original BF16 projections stay BF16 on the GPU. Projections
+whose caller already has only Q8_1 activations consume those activations without
+requantizing their BF16 weights.
+
+This preserves the quantized weight values and ModelOpt scale sidecars; it does
+not execute NVIDIA's W4A4 activation recipe. Input calibration scales remain in
+the source GGUF as provenance, while Maya uses its normal INT8 decode and FP16
+prefill activation paths. For the initial Swift GLM deployment, use native FP16
+KV/F32 recurrent state and `STRATA_GLM_NO_MTP=1`. Keep independent cache and
+calibration directories. `MAYA_PACK_TEMPLATE=1` retains the publisher's template
+in the frontend process.
+
+`glm_nvfp4_test` checks CPU and GPU dots, distinct/zero/unit tensor scales before
+nonlinearities, BF16/F32 projection fallbacks and the production prefill
+conversion/GEMM/scale operations against independently dequantized weights and
+double-precision reference dots. It requires a GPU and checks every visible GPU.
+`python -m unittest tools.test_iq_pack_glm` checks the original E2M1 codebook,
+group/global scales and invalid scale rejection. Set `STRATA_GGUF_PY` to the
+pinned dependency's `gguf-py` (or a newer compatible copy) for that test.
