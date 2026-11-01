@@ -1195,8 +1195,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             }
         }
 #endif
-        if (const char* cap = getenv("STRATA_GLM_POOL_GB"))
-            avail = std::min(avail, (size_t) (std::atof(cap) * 1073741824.0));
+        avail = glmfast::expert_pool_cap(avail, dev_);
         // STRATA_GLM_VRAM_GB=<n>: behave like a card with n GB - the cap counts everything this process already
         // holds on the device (context, dense weights, state, arenas), so the pool gets what such a card would have
         if (const char* vc = getenv("STRATA_GLM_VRAM_GB")) {
@@ -6242,11 +6241,12 @@ int Glm5Model::fast_sample_verify(strata::kernels::SamplerParams& sp, std::strin
 // this process already holds on the device, so the pool gets what such a card would have).  The prompt path and the
 // layer split search size from the same number, before the pool is carved (a discrete card's: fast_setup prices a
 // unified-memory APU's pool from its RAM).
-Glm5Model::PoolBudget Glm5Model::pool_budget(size_t free_b, size_t total_b, int part, size_t floor_b, size_t slot_b,
+Glm5Model::PoolBudget Glm5Model::pool_budget(size_t free_b, size_t total_b, int part, size_t floor_b, size_t slot_b, int device,
                                              bool unified) {
     PoolBudget b;
     const char* later = part > 0 ? getenv("STRATA_GLM_RESERVE_LATER_MB") : nullptr;
-    const char* r = later != nullptr && later[0] ? later : getenv("STRATA_GLM_RESERVE_MB");
+    const char* r = glmfast::expert_pool_reserve_env(
+        device, later != nullptr && later[0] ? later : getenv("STRATA_GLM_RESERVE_MB"));
     b.reserve_given = r != nullptr && r[0];
     b.reserve = (size_t) (b.reserve_given ? std::max(0LL, std::atoll(r)) : unified ? 1024 : 700) << 20;
     if (const char* ec = getenv("STRATA_GLM_EXPERT_CACHE"); ec != nullptr && part == 0)
@@ -6272,8 +6272,7 @@ Glm5Model::PoolBudget Glm5Model::pool_budget(size_t free_b, size_t total_b, int 
     }
     if (b.fixed > 0 && slot_b > 0) b.avail = std::min(b.avail, (size_t) b.fixed * slot_b);
 
-    if (const char* cap = getenv("STRATA_GLM_POOL_GB"))
-        b.avail = std::min(b.avail, (size_t) (std::atof(cap) * 1073741824.0));
+    b.avail = glmfast::expert_pool_cap(b.avail, device);
     if (const char* vc = getenv("STRATA_GLM_VRAM_GB")) {
         const size_t cap = (size_t) (std::atof(vc) * 1073741824.0);
         const size_t used = total_b - free_b;
@@ -6299,7 +6298,7 @@ size_t Glm5Model::mmq_scratch_reserve() {
 
 // this part's budget: the one above, less what pool_check found short of the reserve once it was written
 Glm5Model::PoolBudget Glm5Model::part_budget(size_t free_b, size_t total_b, size_t floor_b, size_t slot_b) const {
-    PoolBudget b = pool_budget(free_b, total_b, part_, floor_b, slot_b, fast_ != nullptr && fast_->unified_memory);
+    PoolBudget b = pool_budget(free_b, total_b, part_, floor_b, slot_b, dev_, fast_ != nullptr && fast_->unified_memory);
     b.avail = b.avail > pool_short_ ? b.avail - pool_short_ : 0;
     return b;
 }

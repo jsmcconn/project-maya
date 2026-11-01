@@ -5,6 +5,14 @@
 #include <cassert>
 #include <cstdio>
 
+static void reserve_env(const char* key, const char* value) {
+#ifdef _WIN32
+    _putenv_s(key, value ? value : "");
+#else
+    if (value) setenv(key, value, 1); else unsetenv(key);
+#endif
+}
+
 static void check_ram_plan() {
     using namespace strata::core::glmfast;
     // The old weighted split gives class 0 excess slots while starving class 1,
@@ -80,6 +88,30 @@ static void check_ram_plan() {
 
 int main() {
     check_ram_plan();
+    using strata::core::glmfast::expert_pool_reserve_env;
+    using strata::core::glmfast::expert_pool_cap;
+    reserve_env("STRATA_GLM_RESERVE_MB_0", nullptr);
+    reserve_env("STRATA_GLM_RESERVE_MB_1", nullptr);
+    assert(expert_pool_reserve_env(0, nullptr) == nullptr);
+    assert(std::atoll(expert_pool_reserve_env(0, "1536")) == 1536);
+    assert(std::atoll(expert_pool_reserve_env(1, "2048")) == 2048);
+    reserve_env("STRATA_GLM_RESERVE_MB_1", "1024");
+    assert(std::atoll(expert_pool_reserve_env(1, "2048")) == 1024);
+    assert(std::atoll(expert_pool_reserve_env(0, "1536")) == 1536);
+    reserve_env("STRATA_GLM_RESERVE_MB_1", nullptr);
+    constexpr size_t GiB = size_t{1} << 30;
+    reserve_env("STRATA_GLM_POOL_GB", nullptr);
+    reserve_env("STRATA_GLM_POOL_GB_0", nullptr);
+    reserve_env("STRATA_GLM_POOL_GB_1", nullptr);
+    assert(expert_pool_cap(30 * GiB, 0) == 30 * GiB);
+    reserve_env("STRATA_GLM_POOL_GB", "26");
+    reserve_env("STRATA_GLM_POOL_GB_1", "21.25");
+    assert(expert_pool_cap(30 * GiB, 0) == 26 * GiB);
+    assert(expert_pool_cap(30 * GiB, 1) == 21 * GiB + GiB / 4);
+    assert(expert_pool_cap(12 * GiB, 1) == 12 * GiB);
+    reserve_env("STRATA_GLM_POOL_GB", nullptr);
+    reserve_env("STRATA_GLM_POOL_GB_1", nullptr);
+
     using strata::core::glmfast::expert_pool_budget;
     using strata::core::glmfast::minimal_ram_tier;
     using strata::core::glmfast::full_unified_pool;

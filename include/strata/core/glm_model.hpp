@@ -1013,7 +1013,7 @@ public:
         bool reserve_given = false;     // a reserve set by hand is kept as it is
         bool adapted = false;           // the default reserve lowered so the pool holds its floor
     };
-    static PoolBudget pool_budget(size_t free_b, size_t total_b, int part, size_t floor_b, size_t slot_b,
+    static PoolBudget pool_budget(size_t free_b, size_t total_b, int part, size_t floor_b, size_t slot_b, int device,
                                   bool unified = false);
     PoolBudget part_budget(size_t free_b, size_t total_b, size_t floor_b, size_t slot_b) const;   // ... less pool_short_
     void pool_check(size_t floor_b, size_t slot_b, size_t all_b);   // auto: the budget written once, free VRAM read again
