@@ -1129,14 +1129,20 @@ bool Glm5Model::fast_setup(std::string& err) {
             }
         }
     }
-    // the one-GPU MTP decode (glm_mtp.cu; load_pack loaded the NextN block for it): the same window, the NextN cache
+    // Block MTP: every part reserves the verify window; the NextN part also keeps the cache
     // fill's rows, the draft head and the chain's token_embd - before the pool too; without them, token by token
-    if (mtp_il_ >= 0 && split_next_ == nullptr && l0_ == 0 && !dflash_on_ && mtp_decode_wanted(dev_, n_parts_)) {
+    if (!dflash_on_ && mtp_decode_wanted(dev_, n_parts_)) {
         std::string werr;
-        if (win_reserve(werr) && mtp_cache_setup(werr)) {
+        const bool reserved = win_reserve(werr);
+        const bool cached = reserved && (mtp_il_ < 0 || mtp_cache_setup(werr));
+        if (cached && mtp_il_ >= 0) {
             mtp_dec_ = true;
             mtp_draft_setup();
-        } else {
+        } else if (!cached) {
+            if (n_parts_ > 1) {
+                err = "glm mtp: split window setup failed: " + werr;
+                return false;
+            }
             std::fprintf(stderr, "glm mtp: CUDA%d %s - decoding token by token\n", dev_, werr.c_str());
         }
     }

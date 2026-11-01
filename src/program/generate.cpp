@@ -2385,7 +2385,7 @@ static int glm_pack_generate(const Options& o) {
                              (unsigned long long) (model.mtp_rounds_ - rounds0),
                              (double) n_spec / (double) (model.mtp_rounds_ - rounds0), lens.c_str());
             }
-        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
+        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready() && req_spec != 1) {
             // the pipelined speculative decode: the two halves of the split work on consecutive tokens, the head
             // running the NextN block's draft (same tokens as the loop below)
             // STRATA_GLM_SPEC_WIN=1: the MTP drafts + the pipelined verify window through a split (decode_spec_pipe)
