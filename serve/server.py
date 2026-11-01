@@ -4736,10 +4736,13 @@ def json_from_text(text: str) -> str:
         except ValueError:
             pass
     dec = json.JSONDecoder()
-    for m in re.finditer(r"[\[{]", s):
+    # A non-JSON code fence can contain valid JSON fragments (Python's [] or
+    # {}). Do not replace an entire generated program with one of those literals.
+    outside = re.sub(r"```.*?```", "", s, flags=re.S)
+    for m in re.finditer(r"[\[{]", outside):
         try:
-            _, end = dec.raw_decode(s, m.start())
-            return s[m.start():end]
+            _, end = dec.raw_decode(outside, m.start())
+            return outside[m.start():end]
         except ValueError:
             continue
     return text
