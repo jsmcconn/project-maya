@@ -91,7 +91,9 @@ bool mv(GlmDsaFast* ext, const gf::MvJob* jobs, int n, cudaStream_t s) {
     for (int i = 0; i < n; ++i)
         if (float_type(jobs[i].type) && jobs[i].xf == nullptr) need = true;
     if (!need) return run_mv(ext, jobs, n, s);
-    if (ext == nullptr || ext->act == nullptr) {
+    // Flash's GEMV handles q8_1 input for floating-point weights directly.
+    if (ext == nullptr) return gf::mv(jobs, n, s);
+    if (ext->act == nullptr) {
         std::fprintf(stderr, "glm-dsa mv: a BF16/F32 weight with only a q8_1 input and no fallback scratch\n");
         return false;
     }

@@ -102,14 +102,14 @@ inline bool float_type(int type) { return type == kTypeF32 || type == kTypeBF16;
 /// gf::mv with the float-input fallback: a job whose weight is BF16 / F32 but which carries only a q8_1 input (xf null)
 /// gets that input dequantized into ext->act first (one row per distinct input).  Jobs that need no fallback pass
 /// through unchanged, so on glm5-next (ext null) this IS gf::mv.  False when gf::mv refuses, or a fallback is needed
-/// and there is no ext.
+/// and DSA has no scratch. Flash uses gf::mv's direct q8_1 path.
 bool mv(GlmDsaFast* ext, const strata::kernels::glmf::MvJob* jobs, int n, cudaStream_t s);
 
 /// The shared expert's down when moe_gate_up's fused shared down cannot dot its type (!shexp_fused_ok: BF16 / F32, or a
 /// B10.7 type - F16, Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL): the down runs here instead (glmdsa::mv into sh_out: BF16 / F32 on
 /// sh_hq dequantized, the B10.7 types on sh_hq through ext_mv) and `apart` is set: the caller then passes a null sh_down
 /// to moe_gate_up and still hands sh_out to moe_down.  apart = false (nothing launched) for a type the fused dot serves.
-/// ext may be null (glm5-next): the B10.7 types need no fallback; BF16 / F32 then fail (no scratch).
+/// With no DSA extension (GLM5-Next), gf::mv handles the q8_1 input directly.
 bool shexp_down_apart(GlmDsaFast* ext, const WSlot& sh_down, const void* sh_hq, int n_ff_sh, int n_embd, float* sh_out,
                       cudaStream_t s, bool& apart);
 
